@@ -1,73 +1,50 @@
 """
-玩家输入
-→ 读取conversation_history
-→ 组合系统提示词、历史记录和当前消息
-→ 调用DeepSeek
-→ 获得NPC回复
-→ 保存user消息
-→ 保存assistant回复
-→ 超过5轮时删除最早记录
+main.py
+
+程序主入口，负责：
+
+1. 读取LLM配置；
+2. 创建DeepSeek客户端；
+3. 加载Embedding模型；
+4. 创建长期记忆提取器；
+5. 初始化全部NPC；
+6. 显示NPC选择菜单；
+7. 管理玩家与NPC之间的对话；
+8. 调用长期记忆检索和结构化记忆提取。
 """
 
-import os
-import re
-from dotenv import load_dotenv
 from openai import OpenAI
 from sentence_transformers import SentenceTransformer
-import json
-from pathlib import Path
-import numpy as np
 
-NPC_PROFILE = {
-    "name": "林舟",
-    "role": "赛博小镇物资管理员",
-    "personality": "沉稳、友善、说话简洁，对小镇的物资和居民比较了解",
-}
-NPC_PROFILE["name"]          # NPC姓名
-NPC_PROFILE["role"]          # NPC职业
-NPC_PROFILE["personality"]   # NPC性格
+from agents import NPCAgentManager
+from config import load_config
+from memory import (
+    apply_memory_extraction,
+    get_working_memory,
+    load_memory,
+    load_vector_memory,
+    retrieve_relevant_memories,
+    save_memory,
+)
+from memory_extractor import MemoryExtractor
+from npc import NPC
 
-# 短期记忆最多保存5轮，一轮包含一条玩家消息和一条NPC回复
-MAX_HISTORY_ROUNDS = 5
+# MemoryQueryPlanner负责分析玩家正在查询哪类长期记忆。
+from memory_query_planner import MemoryQueryPlanner
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-MEMORY_FILE = PROJECT_ROOT / "data" / "lin_zhou_memory.json"
-VECTOR_MEMORY_FILE = PROJECT_ROOT / "data" / "lin_zhou_vector_memory.json"
-
+# Embedding模型名称：
+# 用于把玩家问题和长期记忆转换成向量。
 EMBEDDING_MODEL_NAME = "BAAI/bge-small-zh-v1.5"
 
 
+def create_llm_client(
+    api_key: str,
+    base_url: str,
+) -> OpenAI:
+    """根据环境配置创建OpenAI兼容客户端。"""
 
-# 相似度低于该值的记忆不返回
-MIN_SIMILARITY = 0.55
-
-def load_config():
-    """读取并检查LLM配置。"""
-
-    # 将.env中的变量加载到当前程序环境
-    load_dotenv()
-
-    api_key = os.getenv("LLM_API_KEY")
-    base_url = os.getenv("LLM_BASE_URL")
-    model = os.getenv("LLM_MODEL")
-
-    # 找出没有填写的配置项
-    config = {
-        "LLM_API_KEY": api_key,
-        "LLM_BASE_URL": base_url,
-        "LLM_MODEL": model,
-    }
-    missing_items = [name for name, value in config.items() if not value]
-
-    if missing_items:
-        missing_text = ", ".join(missing_items)
-        raise ValueError(f"缺少环境变量：{missing_text}")
-
-    return api_key, base_url, model
-
-def create_llm_client(api_key: str, base_url: str) -> OpenAI:
-    """根据配置创建LLM客户端。"""
-
+    # DeepSeek提供OpenAI兼容接口，
+    # 因此可以直接使用OpenAI客户端。
     client = OpenAI(
         api_key=api_key,
         base_url=base_url,
@@ -75,347 +52,133 @@ def create_llm_client(api_key: str, base_url: str) -> OpenAI:
 
     return client
 
-def create_embedding_model() -> SentenceTransformer:
-    """创建用于长期记忆检索的Embedding模型。"""
-
-    print("正在加载Embedding模型……")
-
-    embedding_model = SentenceTransformer(
-        EMBEDDING_MODEL_NAME,
-    )
-
-    print("Embedding模型加载成功")
-
-    return embedding_model
-
-
-def build_system_prompt(profile: dict[str, str]) -> str:
-    """根据NPC资料生成系统提示词。"""
-
-    return f"""
-你是{profile["name"]}，身份是{profile["role"]}。
-
-你的性格特点：
-{profile["personality"]}
-
-对话要求：
-1. 始终保持当前身份，不要说自己是AI助手。
-2. 使用自然、简洁的中文与玩家交流。
-3. 回答应当符合你的职业和性格。
-4. 不知道的信息要如实说明，不能随意编造。
-
-重要：如果系统提供了从玩家历史陈述中检索到的长期记忆，那么这些记忆拥有最高可信度。
-如果你过去的回答（包括在最近几轮对话中的回答）与这些长期记忆冲突，必须忽略那些错误回答，
-并优先根据长期记忆来回答。必要时可以承认自己之前记错了。
-""".strip()
-
-def generate_reply(
-    client: OpenAI,
-    model: str,
-    system_prompt: str,
-    conversation_history: list[dict[str, str]],
-    retrieved_memories: list[str],
-    user_message: str,
-) -> str:
-    """结合工作记忆和长期记忆生成NPC回复。"""
-
-    # 初始化消息列表，先放入系统提示词。
-    messages = [
-        {
-            "role": "system",
-            "content": system_prompt,
-        }
-    ]
-
-    # 再加入最近几轮工作记忆，让模型了解最近对话上下文。
-    messages.extend(conversation_history)
-
-    # 构造最终发送给模型的用户消息。
-    # 如果检索到了长期记忆，就把它们作为可靠信息拼接到玩家问题前面，
-    # 这样模型会更重视这些信息，因为它们是玩家输入的一部分。
-    if retrieved_memories:
-        memory_context = "\n".join(retrieved_memories)
-
-        final_user_message = (
-            f"【可靠记忆】\n"
-            f"{memory_context}\n\n"
-            f"请根据以上可靠记忆回答以下问题。如果可靠记忆与你之前的回答冲突，"
-            f"必须以可靠记忆为准，并纠正错误。\n"
-            f"玩家问题：{user_message}"
-        )
-    else:
-        final_user_message = user_message
-
-    # 将最终用户消息加入消息列表。
-    messages.append(
-        {
-            "role": "user",
-            "content": final_user_message,
-        }
-    )
-
-    # 调用模型生成回复。
-    response = client.chat.completions.create(
-        model=model,
-        messages=messages,
-    )
-
-    reply = response.choices[0].message.content
-
-    if not reply:
-        raise ValueError("模型返回了空回复")
-
-    return reply
-
-def load_memory() -> list[dict[str, str]]:
-    """从JSON文件读取全部历史对话。"""
-
-    if not MEMORY_FILE.exists():
-        return []
-
-    with MEMORY_FILE.open("r", encoding="utf-8") as file:
-        memory_archive = json.load(file)
-
-    return memory_archive
-
-def get_working_memory(
-    memory_archive: list[dict[str, str]],
-) -> list[dict[str, str]]:
-    """从完整档案中获取最近几轮对话。"""
-
-    max_history_messages = MAX_HISTORY_ROUNDS * 2
-    return memory_archive[-max_history_messages:]
-
-
-
-
-
-def is_question(text: str) -> bool:
-    """判断一条玩家消息是否主要是在提问。"""
-
-    question_words = (
-        "什么",
-        "多少",
-        "是谁",
-        "哪",
-        "怎么",
-        "为什么",
-        "是否",
-        "吗",
-    )
-
-    return (
-        "？" in text
-        or "?" in text
-        or any(word in text for word in question_words)
-    )
-
-def retrieve_relevant_memories(
-    vector_memories: list[dict],
-    query: str,
-    embedding_model: SentenceTransformer,
-    top_k: int = 3,
-    min_similarity: float = MIN_SIMILARITY,
-) -> list[str]:
-    """从持久化向量记忆中检索相关事实。"""
-
-    if not vector_memories:
-        return []
-
-    query_embedding = embedding_model.encode(
-        query,
-        normalize_embeddings=True,
-    )
-
-    memory_embeddings = np.asarray(
-        [
-            memory["embedding"]
-            for memory in vector_memories
-        ],
-        dtype=np.float32,
-    )
-
-    similarities = memory_embeddings @ query_embedding
-
-    scored_memories = [
-        (
-            float(similarity),
-            vector_memories[index]["content"],
-        )
-        for index, similarity in enumerate(similarities)
-        if float(similarity) >= min_similarity
-    ]
-
-    scored_memories.sort(
-        key=lambda item: item[0],
-        reverse=True,
-    )
-
-    return [
-        (
-            f"玩家以前主动提供的信息：{content}"
-            f"（语义相似度：{score:.4f}）"
-        )
-        for score, content in scored_memories[:top_k]
-    ]
-
-
-def save_memory(conversation_history: list[dict[str, str]]) -> None:
-    """将NPC记忆保存到JSON文件。"""
-
-    # data目录不存在时自动创建
-    MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-    with MEMORY_FILE.open("w", encoding="utf-8") as file:
-        json.dump(
-            conversation_history,
-            file,
-            ensure_ascii=False,
-            indent=2,
-        )
-
-def load_vector_memory() -> list[dict]:
-    """读取已经生成Embedding的长期记忆。"""
-
-    if not VECTOR_MEMORY_FILE.exists():
-        return []
-
-    with VECTOR_MEMORY_FILE.open("r", encoding="utf-8") as file:
-        return json.load(file)
-
-
-def save_vector_memory(vector_memories: list[dict]) -> None:
-    """保存长期记忆向量文本及其Embedding向量。"""
-
-    #.mkdir(...)：创建这个文件夹，如果父文件夹不存在也一并创建，exist_ok=True表示如果文件夹已经存在就不报错。
-    VECTOR_MEMORY_FILE.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    with VECTOR_MEMORY_FILE.open("w", encoding="utf-8") as file:
-        json.dump(
-            vector_memories,
-            file,
-            ensure_ascii=False,
-            indent=2,
-        )
 
 def run_chat(
-    client: OpenAI,
-    model: str,
-    system_prompt: str,
+    npc: NPC,
     embedding_model: SentenceTransformer,
+    memory_extractor: MemoryExtractor,
+    memory_query_planner: MemoryQueryPlanner,
 ) -> None:
-    """持续对话，并管理工作记忆、完整档案和向量记忆。"""
+    """运行玩家与指定NPC之间的持续对话。"""
 
-    # 读取原始JSON中的全部历史对话
-    memory_archive = load_memory()
+    # npc_id用于区分不同NPC的独立记忆文件。
+    npc_id = npc.npc_id
 
-    # 从完整历史中选择最近5轮作为工作记忆
+    # 加载当前NPC的全部原始对话档案。
+    memory_archive = load_memory(npc_id=npc_id)
+
+    # 从完整对话档案中提取最近几轮工作记忆。
     conversation_history = get_working_memory(
-        memory_archive
+        memory_archive=memory_archive,
     )
 
-    # 读取已经生成Embedding的长期向量记忆
-    vector_memories = load_vector_memory()
+    # 加载当前NPC的结构化长期向量记忆。
+    vector_memories = load_vector_memory(
+        npc_id=npc_id,
+    )
 
-    # 如果向量记忆为空，就把旧对话迁移进去
-    if not vector_memories:
-        for message in memory_archive:
-            # 只迁移玩家说过的话
-            if message.get("role") != "user":
-                continue
-
-            # 获取玩家消息
-            content = message.get("content", "").strip()
-
-            # 跳过空消息和问题
-            if not content or is_question(content):
-                continue
-
-            # 生成向量并保存
-            add_vector_memory(
-                vector_memories=vector_memories,
-                user_message=content,
-                embedding_model=embedding_model,
-            )
-
-        # 显示迁移结果
-        print(f"旧记忆迁移完成，共{len(vector_memories)}条。")
-
-    # 显示当前各种记忆的数量
+    # 显示当前NPC的记忆状态。
     print(
         f"\n已保存{len(memory_archive) // 2}轮历史，"
-        f"本次加载最近{len(conversation_history) // 2}轮。"
+        f"本次加载最近{len(conversation_history) // 2}轮，"
+        f"长期向量记忆{len(vector_memories)}条。"
     )
 
-    # 显示向量记忆数量
-    print(
-        f"已加载{len(vector_memories)}条长期向量记忆。"
-    )
+    print("输入“返回”可以选择其他NPC。")
+    print("输入“退出”可以结束程序。")
 
-    # 提示玩家如何退出
-    print("对话已经开始，输入“退出”可以结束程序。")
-
-    # 持续接收玩家输入
     while True:
-        # 获取并清理玩家输入
+        # 读取并清理玩家输入。
         user_message = input("\n你：").strip()
 
-        # 玩家输入退出指令时结束程序
+        # “退出”用于结束整个程序。
         if user_message in {"退出", "exit", "quit"}:
             print("对话结束。")
-            break
+            raise SystemExit
 
-        # 阻止发送空消息
+        # “返回”只结束当前NPC的对话。
+        if user_message in {"返回", "back"}:
+            print(f"你结束了与{npc.name}的对话。")
+            return
+
+        # 不向模型发送空消息。
         if not user_message:
             print("输入不能为空，请重新输入。")
             continue
 
-        # 显示NPC思考提示
-        print(f"{NPC_PROFILE['name']}正在思考……")
+        print(f"{npc.name}正在思考……")
 
+        # 第一步：让DeepSeek分析当前问题是否需要长期记忆，
+        # 并推断可能对应的memory_key。
         try:
-            # 从持久化向量记忆中检索相关内容
+            query_plan = memory_query_planner.plan(
+                user_message=user_message,
+            )
+
+            # 显示查询规划结果，方便观察系统行为。
+            print(
+                "[记忆查询计划："
+                f"需要记忆={query_plan.needs_memory}；"
+                f"记忆键={query_plan.memory_keys}；"
+                f"语义查询={query_plan.semantic_query or '无'}；"
+                f"置信度={query_plan.confidence:.2f}]"
+            )
+
+            # 显示规划原因，方便调试错误查询。
+            if query_plan.reason:
+                print(
+                    f"[查询规划原因：{query_plan.reason}]"
+                )
+
+        except Exception as error:
+            # 查询规划失败时设置为None。
+            #
+            # retrieve_relevant_memories()收到None后，
+            # 会退回到旧版纯Embedding检索，
+            # 不会影响玩家正常对话。
+            print(f"[记忆查询规划失败：{error}]")
+            query_plan = None
+
+        # 第二步：执行memory_key精确匹配和Embedding语义检索。
+        try:
             retrieved_memories = retrieve_relevant_memories(
                 vector_memories=vector_memories,
                 query=user_message,
                 embedding_model=embedding_model,
+                query_plan=query_plan,
             )
 
-            # 显示检索到的长期记忆数量
-            print(
-                f"[检索到{len(retrieved_memories)}"
-                f"条相关长期记忆]"
-            )
+        except Exception as error:
+            # 长期记忆检索失败时，
+            # NPC仍然可以使用工作记忆正常回复。
+            print(f"[长期记忆检索失败：{error}]")
+            retrieved_memories = []
+                # 显示检索结果，方便学习和调试。
 
-            # 显示每条长期记忆，方便检查检索效果
-            for index, memory in enumerate(
-                retrieved_memories,
-                start=1,
-            ):
-                print(f"[长期记忆{index}] {memory}")
 
-            # 将系统提示词、工作记忆、长期记忆和当前问题交给LLM
-            reply = generate_reply(
-                client=client,
-                model=model,
-                system_prompt=system_prompt,
+        print(f"[检索到{len(retrieved_memories)}条相关长期记忆]")
+
+        for index, memory in enumerate(
+            retrieved_memories,
+            start=1,
+        ):
+            print(f"[长期记忆{index}] {memory}")
+
+        # 结合角色设定、工作记忆和长期记忆生成回复。
+        try:
+            reply = npc.generate_reply(
                 conversation_history=conversation_history,
                 retrieved_memories=retrieved_memories,
                 user_message=user_message,
             )
-
-        # 捕获检索或模型调用中的错误
         except Exception as error:
             print(f"调用模型失败：{error}")
             continue
 
-        # 输出NPC回复
-        print(f"\n{NPC_PROFILE['name']}：{reply}")
+        # 输出NPC回复。
+        print(f"\n{npc.name}：{reply}")
 
-        # 把本轮玩家消息加入完整对话档案
+        # 将玩家消息加入完整原始对话档案。
         memory_archive.append(
             {
                 "role": "user",
@@ -423,7 +186,7 @@ def run_chat(
             }
         )
 
-        # 把本轮NPC回复加入完整对话档案
+        # 将NPC回复加入完整原始对话档案。
         memory_archive.append(
             {
                 "role": "assistant",
@@ -431,111 +194,229 @@ def run_chat(
             }
         )
 
-        # 将更新后的完整对话保存到原始JSON文件
-        save_memory(memory_archive)
+        # 每轮对话结束后立即保存原始档案，
+        # 避免程序异常退出时丢失对话。
+        try:
+            save_memory(
+                npc_id=npc_id,
+                memory_archive=memory_archive,
+            )
+        except Exception as error:
+            print(f"[原始对话档案保存失败：{error}]")
 
-        # 尝试把玩家本轮提供的事实写入向量记忆
-        # 如果本轮是问题，add_vector_memory()会自动跳过
-        add_vector_memory(
-            vector_memories=vector_memories,
-            user_message=user_message,
-            embedding_model=embedding_model,
-        )
-
-        # 重新获取最近5轮，供下一轮对话使用
+        # 重新截取最近几轮，作为下一轮工作记忆。
         conversation_history = get_working_memory(
-            memory_archive
+            memory_archive=memory_archive,
         )
 
-        # 显示三种记忆的当前数量
+        # 只把本轮原始玩家消息交给记忆提取器。
+        #
+        # 不传入NPC回复，防止NPC编造的内容进入长期记忆；
+        # 不传入历史记录，减少旧内容对本轮提取结果的干扰。
+        try:
+            extraction_result = memory_extractor.extract(
+                user_message=user_message,
+            )
+
+            # 应用提取结果：
+            # REMEMBER ->新增或更新记忆；
+            # FORGET   ->删除对应记忆；
+            # NONE     ->不做任何处理。
+            # 应用长期记忆提取结果。
+
+            # vector_memories是当前NPC已经加载的结构化长期记忆，
+            # 函数会根据memory_key判断新增、更新或删除。
+            memory_statistics = apply_memory_extraction(
+                npc_id=npc_id,
+                vector_memories=vector_memories,
+                extraction_result=extraction_result,
+                embedding_model=embedding_model,
+            )
+
+            # 显示本轮结构化记忆处理结果。
+            print(
+                "[长期记忆处理："
+                f"新增{memory_statistics['added']}条，"
+                f"更新{memory_statistics['updated']}条，"
+                f"删除{memory_statistics['deleted']}条，"
+                f"跳过{memory_statistics['skipped']}条]"
+            )
+
+        except Exception as error:
+            # 记忆提取失败不应该导致正常对话中断。
+            print(f"[长期记忆提取失败：{error}]")
+
+        # 重新读取向量记忆。
+        #
+        # 这样本轮新增、更新或删除的记忆，
+        # 可以在下一轮对话中立即参与检索。
+        try:
+            vector_memories = load_vector_memory(
+                npc_id=npc_id,
+            )
+        except Exception as error:
+            print(f"[长期向量记忆加载失败：{error}]")
+            vector_memories = []
+
+        # 显示当前NPC三种记忆的数量。
         print(
             f"[完整档案：{len(memory_archive) // 2}轮；"
             f"工作记忆：{len(conversation_history) // 2}轮；"
             f"向量记忆：{len(vector_memories)}条]"
         )
 
-def add_vector_memory(
-    vector_memories: list[dict],
-    user_message: str,
+
+def show_npc_menu(
+    npc_manager: NPCAgentManager,
+) -> list[NPC]:
+    """显示全部NPC，并返回NPC列表。"""
+
+    # 从NPC管理器中取得所有NPC对象。
+    npcs = npc_manager.get_all_npcs()
+
+    print("\n========== 赛博小镇 ==========")
+    print("请选择要交谈的NPC：")
+
+    # 根据NPC数量动态生成菜单。
+    for index, npc in enumerate(npcs, start=1):
+        print(f"{index}. {npc.name}——{npc.role}")
+
+    print("0. 退出程序")
+    print("==============================")
+
+    return npcs
+
+
+def run_town(
+    npc_manager: NPCAgentManager,
     embedding_model: SentenceTransformer,
+    memory_extractor: MemoryExtractor,
+    memory_query_planner: MemoryQueryPlanner,
 ) -> None:
-    """将玩家主动提供的信息写入向量记忆。"""
+    """运行赛博小镇NPC选择菜单。"""
 
-    content = user_message.strip()
+    while True:
+        # 每次返回小镇时重新显示NPC列表。
+        npcs = show_npc_menu(
+            npc_manager=npc_manager,
+        )
 
-    if not content:
-        return
+        # 读取玩家的NPC选择。
+        choice = input("\n请输入NPC编号：").strip()
 
-    # 问题不属于玩家主动提供的事实
-    if is_question(content):
-        return
+        # 输入0或退出命令时结束程序。
+        if choice in {"0", "退出", "exit", "quit"}:
+            print("你离开了赛博小镇。")
+            return
 
-    # 避免完全相同的记忆重复保存
-    existing_contents = {
-        memory["content"]
-        for memory in vector_memories
-    }
+        # 菜单编号必须是数字。
+        if not choice.isdigit():
+            print("请输入正确的NPC编号。")
+            continue
 
-    if content in existing_contents:
-        return
+        # 将字符串编号转换成列表索引。
+        npc_index = int(choice) - 1
 
-    embedding = embedding_model.encode(
-        content,
-        normalize_embeddings=True,
-    )
+        # 检查编号是否超出NPC列表范围。
+        if npc_index < 0 or npc_index >= len(npcs):
+            print("没有这个NPC，请重新选择。")
+            continue
 
-    vector_memories.append(
-        {
-            "content": content,
-            "embedding": embedding.tolist(),
-        }
-    )
+        # 获取玩家选中的NPC。
+        selected_npc = npcs[npc_index]
 
-    save_vector_memory(vector_memories)
+        print(
+            f"\n你来到了{selected_npc.name}面前。"
+        )
+        print(
+            f"{selected_npc.name}的身份："
+            f"{selected_npc.role}"
+        )
 
-    print(f"[新增长期向量记忆] {content}")
+        # 开始与选中的NPC对话。
+        run_chat(
+            npc=selected_npc,
+            embedding_model=embedding_model,
+            memory_extractor=memory_extractor,
+            memory_query_planner=memory_query_planner,
+        )
 
-def main():
-    """创建所有组件并启动NPC对话。"""
 
-    # 读取环境变量中的LLM配置
+def main() -> None:
+    """程序主函数。"""
+
+    # 读取.env中的DeepSeek配置。
     api_key, base_url, model = load_config()
 
-    # 显示配置读取结果
     print("配置读取成功")
     print(f"API地址：{base_url}")
     print(f"模型名称：{model}")
     print("API密钥：已读取，不显示具体内容")
 
-    # 创建DeepSeek客户端
+    # 创建DeepSeek客户端。
     client = create_llm_client(
-        api_key,
-        base_url,
+        api_key=api_key,
+        base_url=base_url,
     )
+
     print("LLM客户端创建成功")
 
-    # 加载本地Embedding模型
-    embedding_model = create_embedding_model()
+    # 加载中文Embedding模型。
+    #
+    # 第一次运行可能需要从本地缓存加载较长时间，
+    # 后续运行通常会更快。
+    print(f"正在加载Embedding模型：{EMBEDDING_MODEL_NAME}")
 
-    # 根据NPC资料构建系统提示词
-    system_prompt = build_system_prompt(
-        NPC_PROFILE
+    embedding_model = SentenceTransformer(
+        EMBEDDING_MODEL_NAME,
     )
 
-    # 显示NPC信息
-    print("NPC角色创建成功")
-    print(f"当前NPC：{NPC_PROFILE['name']}")
-    print(f"NPC身份：{NPC_PROFILE['role']}")
+    print("Embedding模型加载成功")
 
-    # 启动对话，并传入Embedding模型
-    run_chat(
+    # 创建长期记忆提取器。
+    #
+    # 它与NPC对话使用同一个DeepSeek客户端，
+    # 但每次API请求彼此独立，不共享messages。
+    memory_extractor = MemoryExtractor(
         client=client,
         model=model,
-        system_prompt=system_prompt,
-        embedding_model=embedding_model,
     )
 
-    
+    print("长期记忆提取器创建成功")
 
+    # 创建长期记忆查询规划器。
+    # 它负责在NPC回复之前判断：
+    # 是否需要长期记忆、需要哪个memory_key、
+    # 以及应该使用什么文本进行语义检索。
+    memory_query_planner = MemoryQueryPlanner(
+        client=client,
+        model=model,
+    )
+
+    print("长期记忆查询规划器创建成功")
+
+    # 创建NPC管理器并初始化全部NPC。
+    npc_manager = NPCAgentManager(
+        client=client,
+        model=model,
+    )
+
+    npc_manager.initialize_npcs()
+
+    print(
+        f"NPC管理器初始化成功，"
+        f"当前共有{npc_manager.get_npc_count()}个NPC。"
+    )
+
+    # 正式进入赛博小镇。
+    run_town(
+        npc_manager=npc_manager,
+        embedding_model=embedding_model,
+        memory_extractor=memory_extractor,
+        memory_query_planner=memory_query_planner,
+    )
+
+
+# 只有直接运行main.py时才启动程序。
 if __name__ == "__main__":
     main()
