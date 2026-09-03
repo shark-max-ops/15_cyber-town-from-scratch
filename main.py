@@ -16,7 +16,7 @@ from openai import OpenAI
 from sentence_transformers import SentenceTransformer
 import json
 from pathlib import Path
-
+import numpy as np
 
 NPC_PROFILE = {
     "name": "林舟",
@@ -32,11 +32,11 @@ MAX_HISTORY_ROUNDS = 5
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 MEMORY_FILE = PROJECT_ROOT / "data" / "lin_zhou_memory.json"
+VECTOR_MEMORY_FILE = PROJECT_ROOT / "data" / "lin_zhou_vector_memory.json"
 
 EMBEDDING_MODEL_NAME = "BAAI/bge-small-zh-v1.5"
 
-# 查询指令只添加到问题，不添加到历史记忆
-QUERY_INSTRUCTION = "为这个句子生成表示以用于检索相关文章："
+
 
 # 相似度低于该值的记忆不返回
 MIN_SIMILARITY = 0.55
@@ -211,78 +211,41 @@ def is_question(text: str) -> bool:
     )
 
 def retrieve_relevant_memories(
-    memory_archive: list[dict[str, str]],
+    vector_memories: list[dict],
     query: str,
     embedding_model: SentenceTransformer,
     top_k: int = 3,
     min_similarity: float = MIN_SIMILARITY,
 ) -> list[str]:
-    """使用Embedding检索玩家过去主动陈述的相关事实。"""
+    """从持久化向量记忆中检索相关事实。"""
 
-    max_working_messages = MAX_HISTORY_ROUNDS * 2
-
-    # 最近5轮已经在工作记忆中，不再重复检索
-    long_term_messages = memory_archive[:-max_working_messages]
-
-    if not long_term_messages:
+    if not vector_memories:
         return []
 
-    candidate_memories: list[str] = []
-
-    for message in long_term_messages:
-        # 只把玩家主动提供的内容作为事实候选
-        if message.get("role") != "user":
-            continue
-
-        content = message.get("content", "").strip()
-
-        if not content:
-            continue
-
-        # 玩家过去提出的问题不作为事实
-        if is_question(content):
-            continue
-
-        candidate_memories.append(content)
-
-    if not candidate_memories:
-        return []
-
-    # 查询添加检索指令
-    query_text = QUERY_INSTRUCTION + query
-
-    # 将当前问题转换成一个向量
     query_embedding = embedding_model.encode(
-        query_text,
+        query,
         normalize_embeddings=True,
     )
 
-    # 一次性将全部候选记忆转换成向量
-    memory_embeddings = embedding_model.encode(
-        candidate_memories,
-        normalize_embeddings=True,
+    memory_embeddings = np.asarray(
+        [
+            memory["embedding"]
+            for memory in vector_memories
+        ],
+        dtype=np.float32,
     )
 
-    # 向量已经归一化，点积结果就是余弦相似度
     similarities = memory_embeddings @ query_embedding
 
-    scored_memories: list[tuple[float, str]] = []
+    scored_memories = [
+        (
+            float(similarity),
+            vector_memories[index]["content"],
+        )
+        for index, similarity in enumerate(similarities)
+        if float(similarity) >= min_similarity
+    ]
 
-    for content, similarity in zip(
-        candidate_memories,
-        similarities,
-    ):
-        similarity_score = float(similarity)
-
-        if similarity_score >= min_similarity:
-            scored_memories.append(
-                (
-                    similarity_score,
-                    content,
-                )
-            )
-
-    # 按语义相似度从高到低排序
     scored_memories.sort(
         key=lambda item: item[0],
         reverse=True,
@@ -295,6 +258,7 @@ def retrieve_relevant_memories(
         )
         for score, content in scored_memories[:top_k]
     ]
+
 
 def save_memory(conversation_history: list[dict[str, str]]) -> None:
     """将NPC记忆保存到JSON文件。"""
@@ -310,52 +274,130 @@ def save_memory(conversation_history: list[dict[str, str]]) -> None:
             indent=2,
         )
 
+def load_vector_memory() -> list[dict]:
+    """读取已经生成Embedding的长期记忆。"""
+
+    if not VECTOR_MEMORY_FILE.exists():
+        return []
+
+    with VECTOR_MEMORY_FILE.open("r", encoding="utf-8") as file:
+        return json.load(file)
+
+
+def save_vector_memory(vector_memories: list[dict]) -> None:
+    """保存长期记忆向量文本及其Embedding向量。"""
+
+    #.mkdir(...)：创建这个文件夹，如果父文件夹不存在也一并创建，exist_ok=True表示如果文件夹已经存在就不报错。
+    VECTOR_MEMORY_FILE.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    with VECTOR_MEMORY_FILE.open("w", encoding="utf-8") as file:
+        json.dump(
+            vector_memories,
+            file,
+            ensure_ascii=False,
+            indent=2,
+        )
+
 def run_chat(
     client: OpenAI,
     model: str,
     system_prompt: str,
     embedding_model: SentenceTransformer,
 ) -> None:
-    """持续对话，并管理完整档案和工作记忆。"""
+    """持续对话，并管理工作记忆、完整档案和向量记忆。"""
 
-    # 读取磁盘中的全部历史
+    # 读取原始JSON中的全部历史对话
     memory_archive = load_memory()
 
-    # 从全部历史中选择最近5轮
-    conversation_history = get_working_memory(memory_archive)
+    # 从完整历史中选择最近5轮作为工作记忆
+    conversation_history = get_working_memory(
+        memory_archive
+    )
 
+    # 读取已经生成Embedding的长期向量记忆
+    vector_memories = load_vector_memory()
+
+    # 如果向量记忆为空，就把旧对话迁移进去
+    if not vector_memories:
+        for message in memory_archive:
+            # 只迁移玩家说过的话
+            if message.get("role") != "user":
+                continue
+
+            # 获取玩家消息
+            content = message.get("content", "").strip()
+
+            # 跳过空消息和问题
+            if not content or is_question(content):
+                continue
+
+            # 生成向量并保存
+            add_vector_memory(
+                vector_memories=vector_memories,
+                user_message=content,
+                embedding_model=embedding_model,
+            )
+
+        # 显示迁移结果
+        print(f"旧记忆迁移完成，共{len(vector_memories)}条。")
+
+    # 显示当前各种记忆的数量
     print(
         f"\n已保存{len(memory_archive) // 2}轮历史，"
         f"本次加载最近{len(conversation_history) // 2}轮。"
     )
+
+    # 显示向量记忆数量
+    print(
+        f"已加载{len(vector_memories)}条长期向量记忆。"
+    )
+
+    # 提示玩家如何退出
     print("对话已经开始，输入“退出”可以结束程序。")
 
+    # 持续接收玩家输入
     while True:
+        # 获取并清理玩家输入
         user_message = input("\n你：").strip()
 
+        # 玩家输入退出指令时结束程序
         if user_message in {"退出", "exit", "quit"}:
             print("对话结束。")
             break
 
+        # 阻止发送空消息
         if not user_message:
             print("输入不能为空，请重新输入。")
             continue
 
+        # 显示NPC思考提示
         print(f"{NPC_PROFILE['name']}正在思考……")
 
         try:
-
+            # 从持久化向量记忆中检索相关内容
             retrieved_memories = retrieve_relevant_memories(
-                memory_archive=memory_archive,
+                vector_memories=vector_memories,
                 query=user_message,
                 embedding_model=embedding_model,
             )
 
-            print(f"[检索到{len(retrieved_memories)}条相关长期记忆]")
+            # 显示检索到的长期记忆数量
+            print(
+                f"[检索到{len(retrieved_memories)}"
+                f"条相关长期记忆]"
+            )
 
-            for index, memory in enumerate(retrieved_memories, start=1):
+            # 显示每条长期记忆，方便检查检索效果
+            for index, memory in enumerate(
+                retrieved_memories,
+                start=1,
+            ):
                 print(f"[长期记忆{index}] {memory}")
-            
+
+            # 将系统提示词、工作记忆、长期记忆和当前问题交给LLM
             reply = generate_reply(
                 client=client,
                 model=model,
@@ -364,19 +406,24 @@ def run_chat(
                 retrieved_memories=retrieved_memories,
                 user_message=user_message,
             )
+
+        # 捕获检索或模型调用中的错误
         except Exception as error:
             print(f"调用模型失败：{error}")
             continue
 
+        # 输出NPC回复
         print(f"\n{NPC_PROFILE['name']}：{reply}")
 
-        # 将本轮对话加入完整档案
+        # 把本轮玩家消息加入完整对话档案
         memory_archive.append(
             {
                 "role": "user",
                 "content": user_message,
             }
         )
+
+        # 把本轮NPC回复加入完整对话档案
         memory_archive.append(
             {
                 "role": "assistant",
@@ -384,37 +431,103 @@ def run_chat(
             }
         )
 
-        # 永久保存完整档案
+        # 将更新后的完整对话保存到原始JSON文件
         save_memory(memory_archive)
 
-        # 重新提取最近5轮，作为下一次请求的工作记忆
-        conversation_history = get_working_memory(memory_archive)
-
-        print(
-            f"[完整档案：{len(memory_archive) // 2}轮；"
-            f"工作记忆：{len(conversation_history) // 2}轮]"
+        # 尝试把玩家本轮提供的事实写入向量记忆
+        # 如果本轮是问题，add_vector_memory()会自动跳过
+        add_vector_memory(
+            vector_memories=vector_memories,
+            user_message=user_message,
+            embedding_model=embedding_model,
         )
 
+        # 重新获取最近5轮，供下一轮对话使用
+        conversation_history = get_working_memory(
+            memory_archive
+        )
+
+        # 显示三种记忆的当前数量
+        print(
+            f"[完整档案：{len(memory_archive) // 2}轮；"
+            f"工作记忆：{len(conversation_history) // 2}轮；"
+            f"向量记忆：{len(vector_memories)}条]"
+        )
+
+def add_vector_memory(
+    vector_memories: list[dict],
+    user_message: str,
+    embedding_model: SentenceTransformer,
+) -> None:
+    """将玩家主动提供的信息写入向量记忆。"""
+
+    content = user_message.strip()
+
+    if not content:
+        return
+
+    # 问题不属于玩家主动提供的事实
+    if is_question(content):
+        return
+
+    # 避免完全相同的记忆重复保存
+    existing_contents = {
+        memory["content"]
+        for memory in vector_memories
+    }
+
+    if content in existing_contents:
+        return
+
+    embedding = embedding_model.encode(
+        content,
+        normalize_embeddings=True,
+    )
+
+    vector_memories.append(
+        {
+            "content": content,
+            "embedding": embedding.tolist(),
+        }
+    )
+
+    save_vector_memory(vector_memories)
+
+    print(f"[新增长期向量记忆] {content}")
 
 def main():
+    """创建所有组件并启动NPC对话。"""
+
+    # 读取环境变量中的LLM配置
     api_key, base_url, model = load_config()
 
+    # 显示配置读取结果
     print("配置读取成功")
     print(f"API地址：{base_url}")
     print(f"模型名称：{model}")
     print("API密钥：已读取，不显示具体内容")
 
-    client = create_llm_client(api_key, base_url)
-    
+    # 创建DeepSeek客户端
+    client = create_llm_client(
+        api_key,
+        base_url,
+    )
     print("LLM客户端创建成功")
+
+    # 加载本地Embedding模型
     embedding_model = create_embedding_model()
 
-    system_prompt = build_system_prompt(NPC_PROFILE)
+    # 根据NPC资料构建系统提示词
+    system_prompt = build_system_prompt(
+        NPC_PROFILE
+    )
 
+    # 显示NPC信息
     print("NPC角色创建成功")
     print(f"当前NPC：{NPC_PROFILE['name']}")
     print(f"NPC身份：{NPC_PROFILE['role']}")
 
+    # 启动对话，并传入Embedding模型
     run_chat(
         client=client,
         model=model,
