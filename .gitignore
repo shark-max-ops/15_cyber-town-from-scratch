@@ -4,3 +4,6 @@ __pycache__/
 *.pyc
 .vscode/
 data/
+
+# NPC对话和运行日志。
+logs/

@@ -25,6 +25,8 @@
 - cached_record：当前读取到的有效背景对话缓存。
 - state_manager：管理全部NPC的运行状态和对话占用。
 - interaction_started：当前玩家是否成功占用NPC。
+- dialogue_logger：负责记录NPC对话、状态变化和程序错误。
+- previous_score：本轮更新前的好感度分数。
 """
 
 from openai import OpenAI
@@ -51,6 +53,8 @@ from relationship_manager import RelationshipManager
 from scene_context import build_scene_context
 # 导入NPC运行状态管理器。
 from state_manager import StateManager
+# 导入NPC对话和状态日志记录器。
+from dialogue_logger import DialogueLogger
 
 # Embedding模型名称：
 # 用于将玩家问题和长期记忆转换成向量。
@@ -85,6 +89,7 @@ def run_chat(
     memory_extractor: MemoryExtractor,
     memory_query_planner: MemoryQueryPlanner,
     relationship_manager: RelationshipManager,
+    dialogue_logger: DialogueLogger,
     player_id: str = DEFAULT_PLAYER_ID,
 ) -> None:
     """运行玩家与指定NPC之间的持续对话。"""
@@ -241,6 +246,15 @@ def run_chat(
         # 输出NPC回复。
         print(f"\n{npc.name}：{reply}")
 
+        # 保存本轮更新前的好感度分数，
+        # 后面写入日志时用于计算变化。
+
+        previous_score = relationship.score
+
+        # 默认没有好感度更新结果。
+        #
+        # 即使分析失败，后面也可以正常记录对话日志。
+        relationship_update = None
         # 第四步：
         # NPC成功回复后分析玩家态度并更新好感度。
         try:
@@ -292,8 +306,16 @@ def run_chat(
                 )
 
         except Exception as error:
-            # 好感度更新失败不影响后续记忆保存。
+            # 控制台显示好感度错误。
             print(f"[好感度更新失败：{error}]")
+
+            # 将错误写入每日JSONL日志。
+            dialogue_logger.log_error(
+                context="更新NPC好感度",
+                error=error,
+                npc_id=npc_id,
+                player_id=player_id,
+            )
 
         # 第五步：
         # 将本轮玩家消息加入完整原始档案。
@@ -378,6 +400,23 @@ def run_chat(
             f"工作记忆：{len(conversation_history) // 2}轮；"
             f"向量记忆：{len(vector_memories)}条]"
         )
+
+        # 将本轮完整对话写入每日JSONL日志。
+        try:
+            dialogue_logger.log_dialogue(
+                npc_id=npc_id,
+                npc_name=npc.name,
+                player_id=player_id,
+                player_message=user_message,
+                npc_reply=reply,
+                retrieved_memories=retrieved_memories,
+                relationship_update=relationship_update,
+                previous_score=previous_score,
+            )
+
+        except Exception as error:
+            # 日志写入失败不能中断下一轮对话。
+            print(f"[对话日志写入失败：{error}]")
 
 
 def get_or_generate_background_dialogues(
@@ -596,6 +635,7 @@ def run_town(
     batch_dialogue_generator: BatchDialogueGenerator,
     background_cache: BackgroundDialogueCache,
     state_manager: StateManager,
+    dialogue_logger: DialogueLogger,
 ) -> None:
     """运行赛博小镇NPC选择菜单。"""
 
@@ -682,6 +722,11 @@ def run_town(
             f"{selected_npc.role}"
         )
 
+        # 保存NPC进入对话前的活动状态。
+        previous_npc_state = state_manager.get_npc_state(
+            npc_id=selected_npc.npc_id,
+        )
+
         # 尝试占用当前NPC。
         #
         # 检查状态和设置忙碌会在同一次加锁操作中完成。
@@ -700,6 +745,23 @@ def run_town(
             )
             continue
 
+        # 记录NPC从背景活动进入对话状态。
+        try:
+            dialogue_logger.log_state_change(
+                npc_id=selected_npc.npc_id,
+                previous_status=(
+                    previous_npc_state.activity_status
+                    if previous_npc_state is not None
+                    else "unknown"
+                ),
+                new_status="talking",
+                player_id=DEFAULT_PLAYER_ID,
+            )
+
+        except Exception as error:
+            # 状态日志失败不影响玩家进入对话。
+            print(f"[NPC状态日志写入失败：{error}]")
+
         try:
             # NPC已进入talking状态，开始实时对话。
             run_chat(
@@ -708,16 +770,53 @@ def run_town(
                 memory_extractor=memory_extractor,
                 memory_query_planner=memory_query_planner,
                 relationship_manager=relationship_manager,
+                dialogue_logger=dialogue_logger,
                 player_id=DEFAULT_PLAYER_ID,
             )
 
         finally:
-            # 无论正常返回、主动退出还是发生异常，
-            # 都必须释放NPC，避免NPC永久处于忙碌状态。
-            state_manager.end_interaction(
+            # 保存释放前的NPC状态。
+            talking_state = state_manager.get_npc_state(
                 npc_id=selected_npc.npc_id,
-                player_id=DEFAULT_PLAYER_ID,
             )
+
+            # 无论正常返回还是出现异常，
+            # 都必须释放NPC占用状态。
+            interaction_ended = (
+                state_manager.end_interaction(
+                    npc_id=selected_npc.npc_id,
+                    player_id=DEFAULT_PLAYER_ID,
+                )
+            )
+
+            # 读取释放后的背景状态。
+            restored_state = state_manager.get_npc_state(
+                npc_id=selected_npc.npc_id,
+            )
+
+            # 释放成功后记录状态变化。
+            if interaction_ended:
+                try:
+                    dialogue_logger.log_state_change(
+                        npc_id=selected_npc.npc_id,
+                        previous_status=(
+                            talking_state.activity_status
+                            if talking_state is not None
+                            else "talking"
+                        ),
+                        new_status=(
+                            restored_state.activity_status
+                            if restored_state is not None
+                            else "unknown"
+                        ),
+                        player_id=DEFAULT_PLAYER_ID,
+                    )
+
+                except Exception as error:
+                    # 日志错误不能影响NPC状态释放。
+                    print(
+                        f"[NPC状态日志写入失败：{error}]"
+                    )
 
 
 def main() -> None:
@@ -794,6 +893,13 @@ def main() -> None:
     # 创建NPC运行状态管理器。
     state_manager = StateManager()
 
+    # 创建NPC对话日志记录器。
+    #
+    # 日志默认保存在项目logs目录中。
+    dialogue_logger = DialogueLogger()
+
+    print("NPC对话日志记录器创建成功")
+
     # 使用NPC管理器中的全部NPC初始化状态。
     state_manager.initialize_npcs(
         npcs=npc_manager.get_all_npcs(),
@@ -842,6 +948,7 @@ def main() -> None:
         ),
         background_cache=background_cache,
         state_manager=state_manager,
+        dialogue_logger=dialogue_logger,
     )
 
 
