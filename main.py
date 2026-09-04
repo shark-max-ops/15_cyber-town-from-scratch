@@ -1,16 +1,23 @@
 """
-main.py
+赛博小镇程序主入口模块。
 
-程序主入口，负责：
+功能说明：
+负责读取配置、初始化NPC、加载记忆系统、生成背景对话、
+显示NPC菜单，以及管理玩家与NPC的持续对话。
 
-1. 读取LLM配置；
-2. 创建DeepSeek客户端；
-3. 加载Embedding模型；
-4. 创建长期记忆提取器；
-5. 初始化全部NPC；
-6. 显示NPC选择菜单；
-7. 管理玩家与NPC之间的对话；
-8. 调用长期记忆检索和结构化记忆提取。
+主要变量含义：
+- client：DeepSeek API客户端。
+- model：当前使用的大语言模型名称。
+- embedding_model：用于长期记忆检索的Embedding模型。
+- memory_extractor：长期记忆写入提取器。
+- memory_query_planner：长期记忆查询规划器。
+- npc_manager：全部NPC对象的统一管理器。
+- batch_dialogue_generator：NPC批量背景对话生成器。
+- background_cache：NPC背景对话缓存管理器。
+- background_result：当前有效的批量背景对话结果。
+- scene_context：当前赛博小镇的场景描述。
+- force_refresh：是否强制忽略缓存并重新生成背景对话。
+- cached_record：当前读取到的有效背景对话缓存。
 """
 
 from openai import OpenAI
@@ -31,6 +38,16 @@ from npc import NPC
 
 # MemoryQueryPlanner负责分析玩家正在查询哪类长期记忆。
 from memory_query_planner import MemoryQueryPlanner
+# 导入批量背景对话生成器。
+from batch_dialogue import BatchDialogueGenerator
+
+# 导入背景对话缓存管理器。
+from background_cache import BackgroundDialogueCache
+
+# 导入批量背景对话结果模型。
+from background_models import BatchBackgroundDialogueResult
+# 导入赛博小镇动态场景上下文生成函数。
+from scene_context import build_scene_context
 
 # Embedding模型名称：
 # 用于把玩家问题和长期记忆转换成向量。
@@ -266,21 +283,149 @@ def run_chat(
         )
 
 
+def get_or_generate_background_dialogues(
+    npc_manager: NPCAgentManager,
+    batch_dialogue_generator: BatchDialogueGenerator,
+    background_cache: BackgroundDialogueCache,
+    force_refresh: bool = False,
+) -> BatchBackgroundDialogueResult | None:
+    """读取有效缓存，或者重新批量生成NPC背景状态。"""
+
+    # 读取当前尚未过期的缓存。
+    cached_record = background_cache.load_valid()
+
+    # 没有要求强制刷新，并且存在有效缓存时，
+    # 直接返回缓存结果，不调用DeepSeek。
+    if not force_refresh and cached_record is not None:
+        # 计算缓存剩余有效时间。
+        remaining_seconds = (
+            background_cache.get_remaining_seconds(
+                cache_record=cached_record,
+            )
+        )
+
+        print(
+            f"\n[已读取背景对话缓存，"
+            f"剩余{remaining_seconds}秒]"
+        )
+
+        return cached_record.result
+
+    # 区分自动更新和玩家手动刷新。
+    if force_refresh:
+        print("\n正在强制刷新所有NPC背景状态……")
+    else:
+        print("\n背景对话缓存不存在或已过期。")
+        print("正在批量生成所有NPC的背景状态……")
+
+    # 根据当前时间生成赛博小镇场景。
+    scene_context = build_scene_context(
+        weather="天气晴朗，微风轻柔",
+        special_event=None,
+    )
+
+    try:
+        # 获取全部NPC对象。
+        npcs = npc_manager.get_all_npcs()
+
+        # 通过一次DeepSeek调用，
+        # 同时生成全部NPC背景状态。
+        background_result = (
+            batch_dialogue_generator.generate(
+                npcs=npcs,
+                scene_context=scene_context,
+            )
+        )
+
+        # 使用新结果覆盖原来的背景缓存。
+        background_cache.save(
+            scene_context=scene_context,
+            result=background_result,
+        )
+
+        print("NPC背景状态批量生成成功。")
+        print(
+            f"[场景：{background_result.scene_summary}]"
+        )
+
+        return background_result
+
+    except Exception as error:
+        # 背景生成失败时不影响玩家正常对话。
+        print(f"[NPC背景状态生成失败：{error}]")
+
+        # 强制刷新失败时，如果原来的有效缓存还在，
+        # 就继续使用原缓存，避免NPC背景状态消失。
+        if cached_record is not None:
+            print("[继续使用刷新前的背景对话缓存]")
+            return cached_record.result
+
+        return None
+
 def show_npc_menu(
     npc_manager: NPCAgentManager,
+    background_result: (
+        BatchBackgroundDialogueResult | None
+    ),
 ) -> list[NPC]:
-    """显示全部NPC，并返回NPC列表。"""
+    """显示全部NPC及其当前背景状态。"""
 
-    # 从NPC管理器中取得所有NPC对象。
+    # 获取全部NPC对象。
     npcs = npc_manager.get_all_npcs()
 
+    # 建立npc_id到背景状态的映射。
+    #
+    # 这样不需要为每个NPC重复遍历整个列表。
+    background_map = {}
+
+    if background_result is not None:
+        background_map = {
+            dialogue.npc_id: dialogue
+            for dialogue in background_result.dialogues
+        }
+
     print("\n========== 赛博小镇 ==========")
-    print("请选择要交谈的NPC：")
 
-    # 根据NPC数量动态生成菜单。
-    for index, npc in enumerate(npcs, start=1):
-        print(f"{index}. {npc.name}——{npc.role}")
+    # 显示当前场景概要。
+    if background_result is not None:
+        print(
+            f"当前场景："
+            f"{background_result.scene_summary}"
+        )
 
+    print("\n请选择要交谈的NPC：")
+
+    # 显示NPC身份和背景状态。
+    for index, npc in enumerate(
+        npcs,
+        start=1,
+    ):
+        print(f"\n{index}. {npc.name}——{npc.role}")
+
+        # 查找当前NPC的缓存背景状态。
+        background_dialogue = background_map.get(
+            npc.npc_id
+        )
+
+        if background_dialogue is not None:
+            print(
+                f"   动作："
+                f"{background_dialogue.action}"
+            )
+            print(
+                f"   情绪："
+                f"{background_dialogue.emotion}"
+            )
+            print(
+                f"   台词："
+                f"“{background_dialogue.speech}”"
+            )
+        else:
+            # 背景生成失败时显示默认状态。
+            print("   状态：正在进行日常活动")
+
+    # 显示菜单控制选项。
+    print("\nr. 刷新所有NPC背景状态")
     print("0. 退出程序")
     print("==============================")
 
@@ -292,37 +437,76 @@ def run_town(
     embedding_model: SentenceTransformer,
     memory_extractor: MemoryExtractor,
     memory_query_planner: MemoryQueryPlanner,
+    batch_dialogue_generator: BatchDialogueGenerator,
+    background_cache: BackgroundDialogueCache,
 ) -> None:
     """运行赛博小镇NPC选择菜单。"""
 
+    # 只在进入run_town()时初始化一次。
+    #
+    # 不能放进while循环，否则玩家输入r后，
+    # 下一轮会立即重新变回False。
+    force_refresh = False
+
     while True:
-        # 每次返回小镇时重新显示NPC列表。
-        npcs = show_npc_menu(
-            npc_manager=npc_manager,
+        # 根据force_refresh决定读取缓存还是重新生成。
+        background_result = (
+            get_or_generate_background_dialogues(
+                npc_manager=npc_manager,
+                batch_dialogue_generator=(
+                    batch_dialogue_generator
+                ),
+                background_cache=background_cache,
+                force_refresh=force_refresh,
+            )
         )
 
-        # 读取玩家的NPC选择。
-        choice = input("\n请输入NPC编号：").strip()
+        # 刷新请求已经在上面处理完毕。
+        #
+        # 下一次正常进入菜单时恢复为读取缓存。
+        force_refresh = False
 
-        # 输入0或退出命令时结束程序。
-        if choice in {"0", "退出", "exit", "quit"}:
+        # 显示NPC及其当前背景状态。
+        npcs = show_npc_menu(
+            npc_manager=npc_manager,
+            background_result=background_result,
+        )
+
+        # 读取玩家菜单输入。
+        choice = input(
+            "\n请输入NPC编号："
+        ).strip()
+
+        # 玩家输入r或“刷新”时，
+        # 设置下一轮循环必须重新生成。
+        if choice.lower() == "r" or choice == "刷新":
+            force_refresh = True
+            continue
+
+        # 玩家输入退出命令时结束程序。
+        if choice in {
+            "0",
+            "退出",
+            "exit",
+            "quit",
+        }:
             print("你离开了赛博小镇。")
             return
 
-        # 菜单编号必须是数字。
+        # NPC编号必须是数字。
         if not choice.isdigit():
             print("请输入正确的NPC编号。")
             continue
 
-        # 将字符串编号转换成列表索引。
+        # 将玩家输入转换成NPC列表索引。
         npc_index = int(choice) - 1
 
-        # 检查编号是否超出NPC列表范围。
+        # 检查编号是否存在。
         if npc_index < 0 or npc_index >= len(npcs):
             print("没有这个NPC，请重新选择。")
             continue
 
-        # 获取玩家选中的NPC。
+        # 获取玩家选择的NPC。
         selected_npc = npcs[npc_index]
 
         print(
@@ -333,14 +517,13 @@ def run_town(
             f"{selected_npc.role}"
         )
 
-        # 开始与选中的NPC对话。
+        # 开始与选中的NPC实时对话。
         run_chat(
             npc=selected_npc,
             embedding_model=embedding_model,
             memory_extractor=memory_extractor,
             memory_query_planner=memory_query_planner,
         )
-
 
 def main() -> None:
     """程序主函数。"""
@@ -407,13 +590,30 @@ def main() -> None:
         f"NPC管理器初始化成功，"
         f"当前共有{npc_manager.get_npc_count()}个NPC。"
     )
+    # 创建NPC批量背景对话生成器。
+    batch_dialogue_generator = BatchDialogueGenerator(
+        client=client,
+        model=model,
+    )
 
+    print("批量背景对话生成器创建成功")
+
+    # 创建背景对话缓存管理器。
+    #
+    # ttl_seconds=300表示缓存5分钟后过期。
+    background_cache = BackgroundDialogueCache(
+        ttl_seconds=300,
+    )
+
+    print("背景对话缓存管理器创建成功")
     # 正式进入赛博小镇。
     run_town(
         npc_manager=npc_manager,
         embedding_model=embedding_model,
         memory_extractor=memory_extractor,
         memory_query_planner=memory_query_planner,
+        batch_dialogue_generator=batch_dialogue_generator,
+        background_cache=background_cache,
     )
 
 
