@@ -1,62 +1,698 @@
-# 赛博小镇项目设计
+# 赛博小镇 Cyber Town
 
-## 1. 我想做什么
-用一两句话描述项目。
-一个二维世界，里面有玩家，npc，记忆，游戏化交互，好感度反馈等等，玩家可以通过对话获取信息、执行任务、获取奖励
+一个由Godot客户端和FastAPI后端组成的AI NPC小镇项目。
 
-## 2. 玩家可以做什么
-列出玩家能够执行的操作。
-有：
-1️⃣上下左右移动
-2️⃣使用道具
-3️⃣选择是否和NPC对话
-4️⃣执行任务
-5️⃣找商人采购物资
-6️⃣等等
+玩家可以在二维小镇中移动，与不同NPC交谈。NPC拥有独立人设、短期记忆、长期向量记忆、好感度和动态背景状态。
 
-## 3. NPC 可以做什么
-列出 NPC 需要具备的能力。
-1、与玩家智能对话
-2、存储记忆
-3、介绍人物
-4、提供奖励
-等等
+## 快速复现
 
-## 4. 第一个最小版本
-第一个版本运行在命令行终端中。
-玩家可以在终端输入文字，与一个名为“小智”的NPC进行对话。NPC具有固定的身份、职业和性格，并通过DeepSeek API生成符合角色设定的回复。
-这一版本只实现最基础的单NPC对话，不包含Godot游戏界面、记忆系统、好感度系统、任务、商店和道具。
+### 1. 准备环境
 
+运行本项目需要：
 
-## 5. 一次对话的数据流程
-玩家在终端输入一段文字
-→ Python程序接收玩家输入
-→ 程序读取NPC的身份和性格设定
-→ 程序将NPC设定与玩家消息组合成请求
-→ 请求被发送给DeepSeek API
-→ DeepSeek生成NPC回复
-→ Python程序接收回复
-→ 在终端中显示NPC的回复
+| 工具 | 建议版本 | 作用 |
+|---|---|---|
+| Git | 最新稳定版 | 克隆项目 |
+| Python | 3.11 | 运行FastAPI后端 |
+| uv | 最新稳定版 | 管理Python环境和依赖 |
+| Godot | 4.5及以上 | 运行游戏客户端 |
+| DeepSeek API Key | 有效密钥 | 调用大语言模型 |
 
+本项目已经在以下环境中运行通过：
 
-## 6. 如何判断第一个版本完成
+```text
+Windows 11
+Python 3.11
+Godot 4.7.2
+DeepSeek API
+```
 
-1. 在终端运行 `python main.py` 后，程序能够正常启动，并显示“请输入你想对NPC说的话”。
-2. 玩家输入“你好，请介绍一下自己”后，NPC能够返回符合其身份、职业和性格设定的回复。
-3. 玩家能够连续进行至少5轮对话，程序在运行过程中不会崩溃；输入“退出”后，程序能够正常结束。
+检查Python：
 
+```powershell
+python --version
+```
 
+预期显示：
 
-| 阶段             | 要解决的问题            | 最终成果         |
-| -------------- | ----------------- | ------------ |
-| 0. 需求设计        | 我到底要做什么           | 一页项目设计说明     |
-| 1. 纯 Python 原型 | NPC 能不能对话         | 终端单 NPC 对话   |
-| 2. 角色系统        | NPC 如何拥有不同性格      | 3 个不同 NPC    |
-| 3. FastAPI 后端  | 外部程序如何调用 NPC      | 可测试的对话 API   |
-| 4. Godot 基础    | 玩家如何移动和接近 NPC     | 无 AI 的小游戏    |
-| 5. 前后端连接       | Godot 如何请求 Python | 游戏内完成一次对话    |
-| 6. 短期记忆        | NPC 如何记住刚才的话      | 连续对话不失忆      |
-| 7. 长期记忆        | NPC 如何记住重要历史      | 重启后仍能检索记忆    |
-| 8. 好感度系统       | 互动如何改变关系          | 好感度动态变化      |
-| 9. 持久化与日志      | 如何保存、排错           | SQLite 数据和日志 |
-| 10. 完整整合       | 如何形成真正项目          | 可运行的赛博小镇     |
+```text
+Python 3.11.x
+```
+
+如果没有安装uv，可以执行：
+
+```powershell
+python -m pip install uv
+```
+
+检查uv：
+
+```powershell
+uv --version
+```
+
+### 2. 克隆项目
+
+打开PowerShell，进入准备存放项目的目录：
+
+```powershell
+cd D:\pyproject\agent
+```
+
+克隆项目：
+
+```powershell
+git clone <你的GitHub仓库地址>
+```
+
+例如：
+
+```powershell
+git clone https://github.com/你的用户名/15-cyber-town-from-scratch.git
+```
+
+进入项目根目录：
+
+```powershell
+cd 15-cyber-town-from-scratch
+```
+
+正确的项目根目录应当包含：
+
+```text
+api.py
+pyproject.toml
+uv.lock
+godot/
+```
+
+如果没有使用Git，也可以在GitHub页面选择：
+
+```text
+Code → Download ZIP
+```
+
+下载并解压后，用VSCode打开项目根目录。
+
+### 3. 安装Python依赖
+
+在项目根目录运行：
+
+```powershell
+uv sync
+```
+
+uv会自动：
+
+```text
+读取pyproject.toml和uv.lock
+→ 创建.venv虚拟环境
+→ 安装FastAPI、OpenAI、Sentence Transformers等依赖
+```
+
+安装完成后，验证依赖：
+
+```powershell
+uv run python -c "import fastapi; import openai; import sentence_transformers; print('依赖安装成功')"
+```
+
+预期输出：
+
+```text
+依赖安装成功
+```
+
+### 4. 配置DeepSeek API
+
+复制环境变量模板：
+
+```powershell
+Copy-Item .env.example .env
+```
+
+打开项目根目录中的`.env`，填写：
+
+```env
+LLM_API_KEY=你的DeepSeek_API密钥
+LLM_BASE_URL=https://api.deepseek.com
+LLM_MODEL=deepseek-v4-flash
+```
+
+例如：
+
+```env
+LLM_API_KEY=sk-xxxxxxxxxxxxxxxx
+LLM_BASE_URL=https://api.deepseek.com
+LLM_MODEL=deepseek-v4-flash
+```
+
+注意：
+
+- 不要在密钥两侧添加引号；
+- 不要在等号两侧添加空格；
+- 不要将真实`.env`上传到GitHub；
+- `.env.example`中不能填写真实密钥。
+
+### 5. 启动FastAPI后端
+
+在项目根目录运行：
+
+```powershell
+uv run uvicorn api:app --reload --host 127.0.0.1 --port 8000
+```
+
+第一次运行会加载Embedding模型：
+
+```text
+BAAI/bge-small-zh-v1.5
+```
+
+因此第一次启动可能需要等待模型下载。
+
+如果看到：
+
+```text
+Warning: You are sending unauthenticated requests to the HF Hub
+```
+
+但程序仍继续加载，这只是没有配置Hugging Face Token的提醒，不影响正常使用。
+
+启动成功后应看到：
+
+```text
+Application startup complete.
+Uvicorn running on http://127.0.0.1:8000
+```
+
+不要关闭这个终端，Godot需要通过它访问AI后端。
+
+### 6. 检查后端是否正常
+
+打开浏览器访问：
+
+```text
+http://127.0.0.1:8000/health
+```
+
+如果能够看到JSON响应，说明后端已经启动。
+
+API文档地址：
+
+```text
+http://127.0.0.1:8000/docs
+```
+
+NPC状态接口：
+
+```text
+http://127.0.0.1:8000/npcs/status
+```
+
+NPC状态接口应当返回三个NPC：
+
+```text
+lin_zhou
+wang_professor
+kang_kang
+```
+
+### 7. 导入Godot客户端
+
+打开Godot项目管理器，点击：
+
+```text
+导入
+```
+
+选择项目中的：
+
+```text
+godot/project.godot
+```
+
+例如：
+
+```text
+D:\pyproject\agent\15-cyber-town-from-scratch\godot\project.godot
+```
+
+点击“导入并编辑”，等待Godot完成资源扫描。
+
+### 8. 检查Godot配置
+
+进入：
+
+```text
+项目 → 项目设置 → 全局
+```
+
+确认存在以下两个自动加载项：
+
+```text
+Config     res://scripts/config.gd
+APIClient  res://scripts/api_client.gd
+```
+
+两项都必须启用，顺序应为：
+
+```text
+Config
+APIClient
+```
+
+打开：
+
+```text
+res://scripts/config.gd
+```
+
+确认后端地址为：
+
+```gdscript
+const API_BASE_URL := "http://127.0.0.1:8000"
+```
+
+NPC编号应为：
+
+```gdscript
+const NPC_IDS := {
+	"林舟": "lin_zhou",
+	"王教授": "wang_professor",
+	"康康": "kang_kang",
+}
+```
+
+### 9. 运行完整项目
+
+确保FastAPI终端仍然运行，然后回到Godot，打开：
+
+```text
+res://scenes/main.tscn
+```
+
+按：
+
+```text
+F5
+```
+
+如果Godot提示尚未设置主场景，选择：
+
+```text
+选择当前场景
+```
+
+正常情况下，FastAPI终端会出现：
+
+```text
+GET /background HTTP/1.1 200 OK
+GET /npcs/status HTTP/1.1 200 OK
+```
+
+Godot输出面板会出现：
+
+```text
+[INFO] API客户端初始化完成
+[INFO] 主场景初始化
+[INFO] NPC背景状态加载成功
+[INFO] 收到NPC状态更新：3个NPC
+```
+
+现在即可进入小镇并与NPC交谈。
+
+### 10. 以后如何快速启动
+
+首次配置完成后，以后只需要两步。
+
+第一步，在项目根目录启动后端：
+
+```powershell
+uv run uvicorn api:app --reload --host 127.0.0.1 --port 8000
+```
+
+第二步，使用Godot打开：
+
+```text
+godot/project.godot
+```
+
+然后按`F5`运行游戏。
+
+停止Godot游戏：
+
+```text
+F8
+```
+
+停止FastAPI：
+
+```text
+在FastAPI终端按Ctrl + C
+```
+
+## 主要功能
+
+- Godot二维地图和玩家移动；
+- 玩家靠近NPC后按E对话；
+- 三个具有不同人设的AI NPC；
+- DeepSeek生成符合人设的回复；
+- 最近5轮工作记忆；
+- JSON完整对话档案；
+- 结构化长期记忆提取；
+- Embedding语义检索；
+- `memory_key`精确记忆查询；
+- NPC独立记忆；
+- NPC好感度系统；
+- 好感度影响NPC回复语气；
+- 批量生成NPC背景动作、情绪和台词；
+- NPC背景缓存和手动刷新；
+- FastAPI前后端接口；
+- NPC并发状态保护；
+- 对话日志和敏感信息基础脱敏。
+
+## 项目结构
+
+```text
+15-cyber-town-from-scratch/
+├── api.py                         # FastAPI入口和API路由
+├── api_models.py                  # API请求与响应模型
+├── application_context.py         # 后端组件统一初始化
+├── dialogue_service.py            # 单轮NPC对话业务流程
+│
+├── config.py                      # Python环境配置
+├── npc.py                         # NPC回复生成
+├── npc_profiles.py                # NPC人设资料
+├── agents.py                      # 多NPC统一管理
+│
+├── memory.py                      # 记忆读取、保存和检索
+├── memory_models.py               # 长期记忆数据模型
+├── memory_extractor.py            # DeepSeek长期记忆提取器
+├── memory_query_planner.py        # 长期记忆查询规划器
+├── migrate_memory.py              # 旧记忆迁移工具
+│
+├── affinity_analyzer.py           # 玩家态度分析
+├── relationship_models.py         # 好感度数据模型
+├── relationship_manager.py        # 好感度管理
+│
+├── background_models.py           # NPC背景状态模型
+├── batch_dialogue.py              # 批量背景状态生成
+├── background_cache.py            # 背景状态缓存
+├── scene_context.py               # 动态小镇场景描述
+│
+├── state_models.py                # NPC运行状态模型
+├── state_manager.py               # NPC状态和并发管理
+├── dialogue_logger.py             # 对话日志
+│
+├── data/                          # 本地记忆与好感度数据
+├── logs/                          # 本地运行日志
+├── md/                            # 项目文档
+│
+├── godot/
+│   ├── project.godot              # Godot项目配置
+│   ├── scenes/
+│   │   ├── main.tscn              # 游戏主场景
+│   │   ├── player.tscn            # 玩家场景
+│   │   ├── npc.tscn               # NPC通用场景
+│   │   └── dialogue_ui.tscn       # 对话界面
+│   ├── scripts/
+│   │   ├── config.gd              # Godot全局配置
+│   │   ├── api_client.gd          # FastAPI通信客户端
+│   │   ├── main.gd                # 主场景管理
+│   │   ├── player.gd              # 玩家移动与交互
+│   │   ├── npc.gd                 # NPC行为
+│   │   └── dialogue_ui.gd         # 对话界面逻辑
+│   └── assets/                    # 图片、地图和音频资源
+│
+├── .env.example                   # 环境变量示例
+├── .gitignore
+├── pyproject.toml
+└── uv.lock
+```
+
+## NPC列表
+
+| npc_id | 姓名 | 身份 |
+|---|---|---|
+| `lin_zhou` | 林舟 | 赛博小镇物资管理员 |
+| `wang_professor` | 王教授 | 图书馆管理员兼退休物理学教授 |
+| `kang_kang` | 康康 | 赛博小镇居民和邮差老周的孩子 |
+
+每个NPC拥有独立的：
+
+- 对话档案；
+- 工作记忆；
+- 长期向量记忆；
+- 好感度；
+- 角色提示词；
+- 运行状态。
+
+## 技术栈
+
+### Python后端
+
+- Python 3.11
+- FastAPI
+- Uvicorn
+- OpenAI兼容客户端
+- DeepSeek API
+- Pydantic
+- Sentence Transformers
+- `BAAI/bge-small-zh-v1.5`
+
+### 游戏客户端
+
+- Godot 4
+- GDScript
+- HTTPRequest
+- CharacterBody2D
+- Area2D
+- CanvasLayer
+
+## 游戏操作
+
+| 按键 | 功能 |
+|---|---|
+| W/A/S/D | 玩家移动 |
+| 方向键 | 玩家移动 |
+| E | 与附近NPC交互 |
+| Enter | 发送对话 |
+| Esc | 关闭对话框 |
+| R | 强制刷新全部NPC背景状态 |
+
+按`R`会真实调用DeepSeek重新生成背景，不建议连续快速触发。
+
+## 使用示例
+
+靠近林舟，按`E`打开对话框，然后输入：
+
+```text
+你好，我叫陈文浩。
+```
+
+继续输入：
+
+```text
+我喜欢喝拿铁，请记住。
+```
+
+经过几轮对话后询问：
+
+```text
+我叫什么？我喜欢喝什么？
+```
+
+林舟会尝试从长期记忆中检索姓名和饮料偏好。
+
+关闭并重新启动项目后再次询问。如果仍然能够回答，说明长期记忆持久化正常。
+
+## 核心API
+
+| 方法 | 路径 | 功能 |
+|---|---|---|
+| GET | `/health` | 检查后端运行状态 |
+| GET | `/npcs/status` | 获取全部NPC状态 |
+| GET | `/npcs/{npc_id}/status` | 获取单个NPC状态 |
+| POST | `/dialogue` | 与NPC进行一轮对话 |
+| GET | `/affinity/{npc_id}/{player_id}` | 查询好感度 |
+| GET | `/background` | 获取或生成背景状态 |
+| POST | `/background/refresh` | 强制刷新背景状态 |
+
+对话请求示例：
+
+```json
+{
+  "npc_id": "lin_zhou",
+  "player_id": "default_player",
+  "player_message": "你还记得我喜欢喝什么吗？"
+}
+```
+
+## 记忆机制
+
+每轮对话使用：
+
+```text
+NPC角色提示词
++ 最近5轮工作记忆
++ 查询规划器找到的长期记忆
++ 玩家当前消息
+```
+
+完整历史保存在JSON中，但不会全部发送给大模型。
+
+长期记忆写入流程：
+
+```text
+玩家消息
+→ DeepSeek提取记忆候选
+→ 判断REMEMBER、FORGET或NONE
+→ 生成结构化memory_key
+→ 计算Embedding
+→ 保存长期向量记忆
+```
+
+长期记忆查询流程：
+
+```text
+玩家问题
+→ 查询规划器判断是否需要记忆
+→ memory_key精确匹配
+→ Embedding语义检索
+→ 综合排序
+→ 将相关记忆交给NPC
+```
+
+## 数据说明
+
+以下目录默认不会上传GitHub：
+
+```text
+data/
+logs/
+```
+
+它们可能包含：
+
+- 玩家对话；
+- 玩家偏好；
+- NPC长期记忆；
+- 好感度数据；
+- 对话日志；
+- 背景状态缓存。
+
+删除这些文件会导致NPC失去相应记忆或关系数据。
+
+## 常见问题
+
+### FastAPI无法启动
+
+确认当前终端位于项目根目录：
+
+```powershell
+Get-Location
+```
+
+然后重新同步依赖：
+
+```powershell
+uv sync
+```
+
+### 浏览器无法访问127.0.0.1:8000
+
+确认FastAPI终端仍然显示：
+
+```text
+Uvicorn running on http://127.0.0.1:8000
+```
+
+如果已经停止，重新运行启动命令。
+
+### 端口被占用
+
+如果显示：
+
+```text
+Address already in use
+```
+
+说明8000端口已经有服务运行。
+
+先打开：
+
+```text
+http://127.0.0.1:8000/health
+```
+
+如果可以访问，就不需要重复启动。
+
+### Godot显示网络请求失败
+
+检查：
+
+- FastAPI是否正在运行；
+- `API_BASE_URL`是否为`http://127.0.0.1:8000`；
+- 浏览器能否打开`/health`；
+- Windows防火墙是否阻止Godot联网。
+
+### POST /dialogue返回422
+
+正确请求字段是：
+
+```text
+npc_id
+player_id
+player_message
+```
+
+注意是`player_message`，不是`message`。
+
+### 后端提示NPC不存在
+
+三个正确编号是：
+
+```text
+lin_zhou
+wang_professor
+kang_kang
+```
+
+康康的编号是`kang_kang`，不是`kangkang`。
+
+### Godot提示Unrecognized UID
+
+关闭Godot，将：
+
+```text
+godot/.godot
+```
+
+重命名为：
+
+```text
+godot/.godot_old
+```
+
+重新打开项目，让Godot重建资源缓存。
+
+## 当前限制
+
+- 当前使用固定玩家编号`default_player`；
+- 运行数据使用本地JSON保存；
+- Embedding模型首次启动需要下载和加载；
+- NPC巡逻尚未使用完整导航系统；
+- Godot客户端主要连接本地FastAPI服务；
+- 尚未实现登录、任务、背包和商店系统。
+
+## 后续扩展方向
+
+- 玩家账户和多存档；
+- SQLite或PostgreSQL数据库；
+- 专用向量数据库；
+- NPC导航和寻路；
+- 游戏任务系统；
+- 背包、道具和商店；
+- 游戏时间和天气；
+- WebSocket流式对话；
+- 多玩家并发；
+- Godot项目导出和部署。

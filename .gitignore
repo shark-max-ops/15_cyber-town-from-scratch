@@ -1,9 +1,53 @@
-.env
-.venv/
-__pycache__/
-*.pyc
-.vscode/
-data/
+# ==================== Python ====================
 
-# NPC对话和运行日志。
+__pycache__/
+*.py[cod]
+*$py.class
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+.venv/
+venv/
+
+
+# ==================== 环境变量和密钥 ====================
+
+.env
+.env.*
+!.env.example
+
+
+# ==================== 运行数据 ====================
+
+data/
 logs/
+*.log
+
+
+# ==================== Godot缓存 ====================
+
+godot/.godot/
+godot/.import/
+
+godot/.godot_old/
+godot/.godot_old_2/
+godot/.godot_cache_backup/
+
+godot_manual_backup/
+
+
+# ==================== 编辑器 ====================
+
+.vscode/
+.idea/
+
+
+# ==================== 操作系统 ====================
+
+.DS_Store
+Thumbs.db
+Desktop.ini
