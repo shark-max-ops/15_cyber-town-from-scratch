@@ -62,13 +62,7 @@ cd D:\pyproject\agent
 克隆项目：
 
 ```powershell
-git clone <你的GitHub仓库地址>
-```
-
-例如：
-
-```powershell
-git clone https://github.com/你的用户名/15-cyber-town-from-scratch.git
+git clone https://github.com/shark-max-ops/15_cyber-town-from-scratch
 ```
 
 进入项目根目录：
