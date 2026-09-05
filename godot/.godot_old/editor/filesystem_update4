@@ -1,0 +1,6 @@
+res://scripts/config.gd
+res://scripts/api_client.gd
+res://scripts/main.gd
+res://scripts/npc.gd
+res://scripts/dialogue_ui.gd
+res://scripts/player.gd
