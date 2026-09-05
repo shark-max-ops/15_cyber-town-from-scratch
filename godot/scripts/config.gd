@@ -19,6 +19,8 @@
 ## - NPC_LABEL_OFFSET：NPC姓名标签偏移。
 ## - DEBUG_MODE：是否输出调试日志。
 ## - SHOW_INTERACTION_RANGE：是否显示交互范围。
+## - API_BACKGROUND：获取或生成NPC背景状态的接口。
+## - API_BACKGROUND_REFRESH：强制刷新NPC背景状态的接口。
 
 extends Node
 
@@ -28,7 +30,8 @@ extends Node
 const API_BASE_URL := "http://127.0.0.1:8000"
 const API_CHAT := API_BASE_URL + "/dialogue"
 const API_NPC_STATUS := API_BASE_URL + "/npcs/status"
-
+const API_BACKGROUND := API_BASE_URL + "/background"
+const API_BACKGROUND_REFRESH := API_BASE_URL + "/background/refresh"
 # 当前后端没有单独的GET /npcs接口，
 # 因此NPC列表暂时从状态接口中取得。
 const API_NPCS := API_NPC_STATUS

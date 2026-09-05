@@ -2,13 +2,14 @@
 ##
 ## 功能说明：
 ## 显示NPC资料、接收玩家输入、发送API请求并展示NPC回复。
+## 每轮对话完成后显示当前关系、好感度和分数变化。
 ## 对话期间暂停玩家和当前NPC的移动。
 ##
 ## 主要变量含义：
 ## - panel：对话框主面板。
 ## - npc_name_label：显示NPC姓名的标签。
 ## - npc_title_label：显示NPC身份的标签。
-## - dialogue_text：显示本次对话内容的富文本控件。
+## - dialogue_text：显示对话和好感度信息的富文本控件。
 ## - player_input：玩家输入框。
 ## - send_button：发送消息按钮。
 ## - close_button：关闭对话按钮。
@@ -39,12 +40,17 @@ func _ready() -> void:
 	## 初始化对话界面和API信号。
 
 	add_to_group("dialogue_system")
-
 	visible = false
 
-	send_button.pressed.connect(_on_send_button_pressed)
-	close_button.pressed.connect(_on_close_button_pressed)
-	player_input.text_submitted.connect(_on_text_submitted)
+	send_button.pressed.connect(
+		_on_send_button_pressed
+	)
+	close_button.pressed.connect(
+		_on_close_button_pressed
+	)
+	player_input.text_submitted.connect(
+		_on_text_submitted
+	)
 
 	api_client = get_node_or_null("/root/APIClient")
 
@@ -52,9 +58,16 @@ func _ready() -> void:
 		api_client.chat_response_received.connect(
 			_on_chat_response_received
 		)
-		api_client.chat_error.connect(_on_chat_error)
+		api_client.chat_error.connect(
+			_on_chat_error
+		)
+		api_client.affinity_updated.connect(
+			_on_affinity_updated
+		)
 	else:
-		Config.log_error("DialogueUI没有找到APIClient")
+		Config.log_error(
+			"DialogueUI没有找到APIClient"
+		)
 
 	Config.log_info("对话UI初始化完成")
 
@@ -84,11 +97,16 @@ func start_dialogue(npc_name: String) -> void:
 
 	var npc := get_npc_by_name(npc_name)
 
-	if npc != null and npc.has_method("set_interacting"):
+	if (
+		npc != null
+		and npc.has_method("set_interacting")
+	):
 		npc.set_interacting(true)
 
 	npc_name_label.text = npc_name
-	npc_title_label.text = Config.get_npc_title(npc_name)
+	npc_title_label.text = Config.get_npc_title(
+		npc_name
+	)
 
 	dialogue_lines.clear()
 	dialogue_lines.append(
@@ -112,9 +130,14 @@ func show_dialogue() -> void:
 
 	visible = true
 
-	var player := get_tree().get_first_node_in_group("player")
+	var player := get_tree().get_first_node_in_group(
+		"player"
+	)
 
-	if player != null and player.has_method("set_interacting"):
+	if (
+		player != null
+		and player.has_method("set_interacting")
+	):
 		player.set_interacting(true)
 
 
@@ -126,16 +149,26 @@ func hide_dialogue() -> void:
 	_set_request_state(false)
 
 	if not current_npc_name.is_empty():
-		var npc := get_npc_by_name(current_npc_name)
+		var npc := get_npc_by_name(
+			current_npc_name
+		)
 
-		if npc != null and npc.has_method("set_interacting"):
+		if (
+			npc != null
+			and npc.has_method("set_interacting")
+		):
 			npc.set_interacting(false)
 
 	current_npc_name = ""
 
-	var player := get_tree().get_first_node_in_group("player")
+	var player := get_tree().get_first_node_in_group(
+		"player"
+	)
 
-	if player != null and player.has_method("set_interacting"):
+	if (
+		player != null
+		and player.has_method("set_interacting")
+	):
 		player.set_interacting(false)
 
 
@@ -165,10 +198,14 @@ func send_message() -> void:
 
 	player_input.text = ""
 	request_in_progress = true
+
 	_set_request_state(true)
 	_render_dialogue()
 
-	api_client.send_chat(current_npc_name, message)
+	api_client.send_chat(
+		current_npc_name,
+		message
+	)
 
 
 func _on_send_button_pressed() -> void:
@@ -206,7 +243,45 @@ func _on_chat_response_received(
 	player_input.grab_focus()
 
 
-func _on_chat_error(error_message: String) -> void:
+func _on_affinity_updated(
+	npc_name: String,
+	level: String,
+	score: int,
+	change: int,
+) -> void:
+	## 在NPC回复后显示好感度结果。
+
+	if npc_name != current_npc_name:
+		return
+
+	var change_text := str(change)
+
+	if change > 0:
+		change_text = "+" + str(change)
+
+	var level_text := level
+
+	if level_text.is_empty():
+		level_text = "未知"
+
+	dialogue_lines.append(
+		"[color=light_green]"
+		+ "关系："
+		+ _safe_text(level_text)
+		+ "｜好感度："
+		+ str(score)
+		+ "/100"
+		+ "｜本轮变化："
+		+ change_text
+		+ "[/color]"
+	)
+
+	_render_dialogue()
+
+
+func _on_chat_error(
+	error_message: String,
+) -> void:
 	## 展示对话请求错误。
 
 	request_in_progress = false
@@ -241,24 +316,29 @@ func _render_dialogue() -> void:
 
 	if request_in_progress:
 		dialogue_text.append_text(
-			"[color=gray]林舟正在思考……[/color]\n"
-			if current_npc_name == "林舟"
-			else (
-				"[color=gray]"
-				+ _safe_text(current_npc_name)
-				+ "正在思考……[/color]\n"
-			)
+			"[color=gray]"
+			+ _safe_text(current_npc_name)
+			+ "正在思考……[/color]\n"
 		)
 
 	dialogue_text.scroll_to_line(
-		max(dialogue_text.get_line_count() - 1, 0)
+		max(
+			dialogue_text.get_line_count() - 1,
+			0
+		)
 	)
 
 
 func _safe_text(text: String) -> String:
-	## 将方括号替换为全角符号，避免玩家输入BBCode。
+	## 防止玩家输入被识别为BBCode。
 
-	return text.replace("[", "［").replace("]", "］")
+	return text.replace(
+		"[",
+		"［"
+	).replace(
+		"]",
+		"］"
+	)
 
 
 func _on_close_button_pressed() -> void:
@@ -267,11 +347,12 @@ func _on_close_button_pressed() -> void:
 	hide_dialogue()
 
 
-
 func get_npc_by_name(npc_name: String) -> Node:
 	## 根据NPC姓名查找场景节点。
 
-	var npcs := get_tree().get_nodes_in_group("npcs")
+	var npcs := get_tree().get_nodes_in_group(
+		"npcs"
+	)
 
 	for npc in npcs:
 		if str(npc.get("npc_name")) == npc_name:
