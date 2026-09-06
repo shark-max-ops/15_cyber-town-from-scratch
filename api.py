@@ -80,29 +80,38 @@ async def lifespan(
 ) -> AsyncGenerator[None, None]:
     """管理FastAPI服务的启动和关闭流程。"""
 
-    # FastAPI启动时初始化全部核心组件。
     print("=" * 60)
     print("赛博小镇后端服务正在启动……")
     print("=" * 60)
 
-    # 初始化DeepSeek、Embedding、NPC、
-    # 记忆、好感度、状态和日志组件。
-    application_context.initialize()
-
-    print("=" * 60)
-    print("赛博小镇后端服务启动成功")
-    print("=" * 60)
-
-    # yield之前是启动阶段。
+    # try/finally可以保证：
     #
-    # 执行到yield后，FastAPI开始接收HTTP请求。
-    yield
+    # 正常关闭、Ctrl+C、Uvicorn重新加载时，
+    # 都会尽量执行application_context.shutdown()。
+    try:
+        # 初始化DeepSeek、Embedding、Qdrant、
+        # NPC、记忆、好感度、状态和日志组件。
+        application_context.initialize()
 
-    # FastAPI关闭时执行这里。
-    print("=" * 60)
-    print("赛博小镇后端服务已经关闭")
-    print("=" * 60)
+        print("=" * 60)
+        print("赛博小镇后端服务启动成功")
+        print("=" * 60)
 
+        # yield之后FastAPI开始接收请求。
+        yield
+
+    finally:
+        print("=" * 60)
+        print("赛博小镇后端服务正在关闭……")
+        print("=" * 60)
+
+        # 关闭Qdrant和LLM客户端，
+        # 避免本地数据库文件锁没有及时释放。
+        application_context.shutdown()
+
+        print("=" * 60)
+        print("赛博小镇后端服务已经关闭")
+        print("=" * 60)
 
 # 创建FastAPI应用。
 app = FastAPI(

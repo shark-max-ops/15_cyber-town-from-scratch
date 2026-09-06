@@ -1,23 +1,29 @@
-"""项目配置读取模块。
+"""
+项目配置读取模块。
+
+功能说明：
+- 从.env文件读取大模型配置。
+- 定义项目公共路径。
+- 定义Qdrant本地数据库配置。
 
 主要变量含义：
-- api_key：大语言模型API密钥。
-- base_url：大语言模型API接口地址。
-- model：调用的大语言模型名称。
-- config：保存全部配置项的字典。
-- missing_items：没有填写的配置项名称列表。
-- missing_text：将缺失配置名称拼接成的提示文字。
-
-环境变量含义：
-- LLM_API_KEY：DeepSeek API密钥。
-- LLM_BASE_URL：DeepSeek API地址。
-- LLM_MODEL：DeepSeek模型名称。
+- PROJECT_ROOT：Python后端项目根目录。
+- QDRANT_PATH：Qdrant本地数据库目录。
+- QDRANT_COLLECTION_NAME：Qdrant长期记忆集合名称。
+- api_key：大模型API密钥。
+- base_url：大模型API地址。
+- model：大模型名称。
 """
 
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+QDRANT_PATH = PROJECT_ROOT / "data" / "qdrant"
+QDRANT_COLLECTION_NAME = "cyber_town_memories"
 
 def load_config() -> tuple[str, str, str]:
     """读取并检查大语言模型配置。"""

@@ -1,51 +1,66 @@
 """
-NPC结构化记忆管理模块。
+NPC对话档案与长期记忆检索模块。
 
-MemoryQueryPlan
-├── memory_key精确匹配：最高优先级
-└── Embedding语义匹配：补充召回
-          ↓
-结合重要性、可信度和时间计算综合分数
+功能说明：
+- 读取和保存NPC完整原始对话档案。
+- 提取最近几轮工作记忆。
+- 读取和保存旧版向量JSON备份。
+- 在Qdrant故障时提供JSON向量检索回退。
+- 将Qdrant查询结果重新排序并整理成可注入LLM的文本。
 
+当前长期记忆职责：
+- QdrantMemoryManager负责长期记忆新增、更新和删除。
+- QdrantMemoryStore负责Qdrant底层数据库操作。
+- 本模块不再负责长期记忆写入判断。
+- 旧版向量JSON只作为备份和故障回退。
 
 主要常量含义：
 - MAX_HISTORY_ROUNDS：发送给NPC的最近对话轮数。
-- MIN_SIMILARITY：长期记忆检索的最低语义相似度。
-- MIN_CONFIDENCE：候选记忆允许保存的最低置信度。
-- MIN_IMPORTANCE：候选记忆允许保存的最低重要度。
-- DUPLICATE_SIMILARITY：判断语义重复的相似度标准。
-- PROJECT_ROOT：项目根目录。
-- DATA_DIR：全部NPC记忆文件所在目录。
+- MIN_SIMILARITY：长期记忆最低语义相似度。
+- EXACT_KEY_BASE_SCORE：memory_key精确匹配基础分。
+- EXACT_SEMANTIC_WEIGHT：精确匹配情况下的语义权重。
+- SEMANTIC_WEIGHT：普通语义匹配权重。
+- IMPORTANCE_WEIGHT：记忆重要度权重。
+- CONFIDENCE_WEIGHT：记忆可信度权重。
+- RECENCY_WEIGHT：记忆时间新鲜度权重。
+- PROJECT_ROOT：Python项目根目录。
+- DATA_DIR：NPC数据文件所在目录。
 
 主要变量含义：
-- npc_id：NPC唯一标识。
-- memory_archive：完整原始对话档案。
+- npc_id：NPC唯一编号。
+- player_id：玩家唯一编号。
+- memory_archive：NPC完整原始对话档案。
 - conversation_history：最近几轮工作记忆。
-- vector_memories：结构化长期向量记忆。
-- extraction_result：DeepSeek返回的结构化记忆结果。
-- candidate：一条候选记忆。
+- vector_memories：从JSON读取的备用长期记忆。
 - query：玩家当前问题。
-- embedding_model：本地Embedding模型。
-- embedding：一条记忆对应的语义向量。
-- similarities：查询与长期记忆的相似度。
-- final_score：结合语义、重要度和时间得到的最终分数。
+- query_plan：DeepSeek生成的长期记忆查询计划。
+- embedding_model：生成查询向量的Embedding模型。
+- qdrant_store：Qdrant长期记忆存储器。
+- retrieved_memories：检索到的相关长期记忆。
+- semantic_similarity：问题和记忆的语义相似度。
+- final_score：长期记忆经过综合计算后的分数。
 """
 
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from uuid import uuid4
+
+from typing import TYPE_CHECKING
 
 import numpy as np
 from pydantic import ValidationError
 from sentence_transformers import SentenceTransformer
 
-# 导入长期记忆相关的数据模型。
 from memory_models import (
-    MemoryExtractionResult,
     MemoryQueryPlan,
     StoredMemory,
 )
+# 只在类型检查阶段导入QdrantMemoryStore。
+#
+# 这样memory.py运行时不会因为类型注解额外创建Qdrant客户端，
+# 也能避免模块之间形成不必要的循环导入。
+if TYPE_CHECKING:
+    from qdrant_memory_store import QdrantMemoryStore
 
 # 最近5轮作为NPC工作记忆
 MAX_HISTORY_ROUNDS = 5
@@ -73,15 +88,6 @@ CONFIDENCE_WEIGHT = 0.10
 
 # 长期记忆时间新鲜度权重。
 RECENCY_WEIGHT = 0.10
-
-# 候选记忆最低置信度
-MIN_CONFIDENCE = 0.70
-
-# 候选记忆最低重要度
-MIN_IMPORTANCE = 0.35
-
-# 判断两条记忆语义重复的相似度
-DUPLICATE_SIMILARITY = 0.97
 
 # 当前项目根目录
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -259,265 +265,6 @@ def save_vector_memory(
             indent=2,
         )
 
-
-def _find_semantic_duplicate(
-    vector_memories: list[dict],
-    memory_type: str,
-    embedding: np.ndarray,
-) -> int | None:
-    """查找语义几乎相同的已有记忆。"""
-
-    # 遍历全部长期记忆
-    for index, memory in enumerate(
-        vector_memories
-    ):
-        # 不同类型的记忆不进行重复判断
-        if memory.get("memory_type") != memory_type:
-            continue
-
-        # 读取已有记忆向量
-        old_embedding = np.asarray(
-            memory.get("embedding", []),
-            dtype=np.float32,
-        )
-
-        # 缺少向量时无法比较
-        if old_embedding.size == 0:
-            continue
-
-        # 向量维度不一致时跳过
-        if old_embedding.shape != embedding.shape:
-            continue
-
-        # 计算两条记忆的语义相似度
-        similarity = float(
-            old_embedding @ embedding
-        )
-
-        # 相似度足够高时认为是同一事实
-        if similarity >= DUPLICATE_SIMILARITY:
-            return index
-
-    # 没有找到重复记忆
-    return None
-
-
-def apply_memory_extraction(
-    npc_id: str,
-    vector_memories: list[dict],
-    extraction_result: MemoryExtractionResult,
-    embedding_model: SentenceTransformer,
-) -> dict[str, int]:
-    """执行DeepSeek提取出的长期记忆操作。"""
-
-    # 统计本轮记忆操作结果
-    statistics = {
-        "added": 0,
-        "updated": 0,
-        "deleted": 0,
-        "skipped": 0,
-    }
-
-    # 标记记忆文件是否发生变化
-    memory_changed = False
-
-    # 遍历本轮提取出的全部候选记忆
-    for candidate in extraction_result.memories:
-        # NONE不需要执行
-        if candidate.action == "NONE":
-            statistics["skipped"] += 1
-            continue
-
-        # 敏感信息禁止保存
-        if candidate.sensitive:
-            print(
-                "[记忆安全] 检测到敏感信息，"
-                "本条内容不会保存"
-            )
-            statistics["skipped"] += 1
-            continue
-
-        # 置信度过低时不保存
-        if candidate.confidence < MIN_CONFIDENCE:
-            statistics["skipped"] += 1
-            continue
-
-        # 重要度过低时不保存
-        if candidate.importance < MIN_IMPORTANCE:
-            statistics["skipped"] += 1
-            continue
-
-        # memory_key为空时无法更新和删除
-        if not candidate.memory_key.strip():
-            statistics["skipped"] += 1
-            continue
-
-        # 执行遗忘操作
-        if candidate.action == "FORGET":
-            # 记录删除前的数量
-            original_count = len(vector_memories)
-
-            # 删除具有相同memory_key的记忆
-            vector_memories[:] = [
-                memory
-                for memory in vector_memories
-                if memory.get("memory_key")
-                != candidate.memory_key
-            ]
-
-            # 计算实际删除数量
-            deleted_count = (
-                original_count
-                - len(vector_memories)
-            )
-
-            # 更新删除统计
-            statistics["deleted"] += deleted_count
-
-            # 实际删除后标记文件变化
-            if deleted_count > 0:
-                memory_changed = True
-
-            continue
-
-        # REMEMBER必须具有值和摘要
-        if (
-            not candidate.value.strip()
-            or not candidate.summary.strip()
-        ):
-            statistics["skipped"] += 1
-            continue
-
-        # 为标准化摘要生成向量
-        embedding = embedding_model.encode(
-            candidate.summary,
-            normalize_embeddings=True,
-        )
-
-        # 查找memory_key完全相同的记忆
-        matching_indices = [
-            index
-            for index, memory
-            in enumerate(vector_memories)
-            if memory.get("memory_key")
-            == candidate.memory_key
-        ]
-
-        # memory_key不同但语义高度相同时也视为重复
-        if not matching_indices:
-            duplicate_index = (
-                _find_semantic_duplicate(
-                    vector_memories=vector_memories,
-                    memory_type=candidate.memory_type,
-                    embedding=embedding,
-                )
-            )
-
-            # 找到语义重复记忆时将其作为更新目标
-            if duplicate_index is not None:
-                matching_indices = [
-                    duplicate_index
-                ]
-
-        # 获取当前UTC时间
-        current_time = datetime.now(
-            timezone.utc
-        )
-
-        # 已存在同类记忆时执行UPDATE
-        if matching_indices:
-            # 获取第一条旧记忆
-            old_memory = vector_memories[
-                matching_indices[0]
-            ]
-
-            # 内容没有变化时跳过重复保存
-            if (
-                old_memory.get("value")
-                == candidate.value
-                and old_memory.get("summary")
-                == candidate.summary
-            ):
-                statistics["skipped"] += 1
-                continue
-
-            # 保留旧记忆ID和创建时间
-            updated_memory = StoredMemory(
-                memory_id=old_memory["memory_id"],
-                memory_type=candidate.memory_type,
-                memory_key=candidate.memory_key,
-                value=candidate.value,
-                summary=candidate.summary,
-                importance=candidate.importance,
-                confidence=candidate.confidence,
-                source="player_statement",
-                source_text=candidate.source_text,
-                created_at=old_memory["created_at"],
-                updated_at=current_time,
-                embedding=embedding.tolist(),
-            )
-
-            # 删除所有相同key或重复记录
-            indices_to_remove = set(
-                matching_indices
-            )
-
-            vector_memories[:] = [
-                memory
-                for index, memory
-                in enumerate(vector_memories)
-                if index not in indices_to_remove
-            ]
-
-            # 加入更新后的记忆
-            vector_memories.append(
-                updated_memory.model_dump(
-                    mode="json"
-                )
-            )
-
-            # 更新统计数据
-            statistics["updated"] += 1
-            memory_changed = True
-
-        # 不存在同类记忆时执行ADD
-        else:
-            # 创建全新的正式记忆
-            new_memory = StoredMemory(
-                memory_id=str(uuid4()),
-                memory_type=candidate.memory_type,
-                memory_key=candidate.memory_key,
-                value=candidate.value,
-                summary=candidate.summary,
-                importance=candidate.importance,
-                confidence=candidate.confidence,
-                source="player_statement",
-                source_text=candidate.source_text,
-                created_at=current_time,
-                updated_at=current_time,
-                embedding=embedding.tolist(),
-            )
-
-            # 加入长期记忆列表
-            vector_memories.append(
-                new_memory.model_dump(
-                    mode="json"
-                )
-            )
-
-            # 更新统计数据
-            statistics["added"] += 1
-            memory_changed = True
-
-    # 只有记忆发生变化时才写入文件
-    if memory_changed:
-        save_vector_memory(
-            npc_id=npc_id,
-            vector_memories=vector_memories,
-        )
-
-    # 返回本轮操作统计
-    return statistics
 
 
 def _calculate_cosine_similarity(
@@ -807,4 +554,242 @@ def retrieve_relevant_memories(
         )
 
     return formatted_memories
+
+
+
+def retrieve_relevant_memories_from_qdrant(
+    *,
+    qdrant_store: "QdrantMemoryStore",
+    npc_id: str,
+    player_id: str,
+    query: str,
+    embedding_model: SentenceTransformer,
+    query_plan: MemoryQueryPlan | None = None,
+    top_k: int = 3,
+) -> list[str]:
+    """
+    使用Qdrant检索与玩家问题相关的长期记忆。
+
+    检索过程：
+    1. 读取查询规划器生成的memory_key；
+    2. 将语义查询转换为Embedding；
+    3. 使用npc_id和player_id限制检索范围；
+    4. 进行memory_key精确匹配；
+    5. 进行Qdrant向量相似度查询；
+    6. 结合重要度、可信度和时间重新排序；
+    7. 转换成可以注入LLM上下文的文字。
+    """
+
+    # 查询规划器明确判断本轮不需要记忆时，
+    # 不调用Embedding模型，也不查询Qdrant。
+    if (
+        query_plan is not None
+        and not query_plan.needs_memory
+    ):
+        return []
+
+    # 优先使用查询规划器改写后的语义查询。
+    #
+    # 例如：
+    # 玩家原问题：我的甜品是什么？
+    # 改写后：玩家以前提供过的食物或甜品偏好
+    if (
+        query_plan is not None
+        and query_plan.semantic_query.strip()
+    ):
+        semantic_query = (
+            query_plan.semantic_query.strip()
+        )
+    else:
+        semantic_query = query.strip()
+
+    # 提取查询规划器生成的memory_key。
+    #
+    # Qdrant会通过payload中的memory_key进行精确过滤。
+    planned_keys = [
+        memory_key.strip().lower()
+        for memory_key in (
+            query_plan.memory_keys
+            if query_plan is not None
+            else []
+        )
+        if memory_key.strip()
+    ]
+
+    # 如果没有可用查询文本，也没有memory_key，
+    # 就没有必要继续检索。
+    if not semantic_query and not planned_keys:
+        return []
+
+    # 将语义查询转换为归一化Embedding。
+    #
+    # 必须和长期记忆写入时使用相同模型及相同归一化方式。
+    query_embedding = embedding_model.encode(
+        semantic_query,
+        normalize_embeddings=True,
+    )
+
+    # 向Qdrant索取比最终数量更多的候选记忆。
+    #
+    # Qdrant先完成向量召回，
+    # Python再根据重要度、可信度和时间进行二次排序。
+    qdrant_memories = qdrant_store.retrieve_memories(
+        npc_id=npc_id,
+        player_id=player_id,
+        memory_keys=planned_keys,
+        query_embedding=query_embedding.tolist(),
+        top_k=max(top_k * 3, 10),
+        score_threshold=MIN_SIMILARITY,
+    )
+
+    # 保存经过二次计算的候选结果。
+    #
+    # 每一项包含：
+    # 综合分数、语义相似度、是否精确匹配、记忆字典。
+    scored_memories: list[
+        tuple[
+            float,
+            float,
+            bool,
+            dict,
+        ]
+    ] = []
+
+    for memory in qdrant_memories:
+        # Qdrant查询结果中的检索来源可能是：
+        #
+        # exact
+        # semantic
+        # exact+semantic
+        retrieval_source = str(
+            memory.get(
+                "retrieval_source",
+                "semantic",
+            )
+        )
+
+        exact_key_match = (
+            "exact" in retrieval_source
+        )
+
+        # 只有精确匹配但没有通过语义阈值时，
+        # similarity可能为None，此时使用0作为展示值。
+        semantic_similarity = float(
+            memory.get("similarity") or 0.0
+        )
+
+        importance = float(
+            memory.get("importance") or 0.0
+        )
+
+        confidence = float(
+            memory.get("confidence") or 0.0
+        )
+
+        # 根据记忆更新时间计算新鲜度。
+        recency_score = _calculate_recency_score(
+            updated_at=str(
+                memory.get("updated_at", "")
+            )
+        )
+
+        if exact_key_match:
+            # memory_key精确匹配时给予较高基础分，
+            # 确保姓名、喜好等明确事实优先返回。
+            final_score = (
+                EXACT_KEY_BASE_SCORE
+                + semantic_similarity
+                * EXACT_SEMANTIC_WEIGHT
+                + importance
+                * 0.05
+                + confidence
+                * 0.10
+                + recency_score
+                * 0.10
+            )
+
+        else:
+            # 没有精确key时主要依赖语义相似度，
+            # 同时参考重要度、可信度和时间。
+            final_score = (
+                semantic_similarity
+                * SEMANTIC_WEIGHT
+                + importance
+                * IMPORTANCE_WEIGHT
+                + confidence
+                * CONFIDENCE_WEIGHT
+                + recency_score
+                * RECENCY_WEIGHT
+            )
+
+        scored_memories.append(
+            (
+                final_score,
+                semantic_similarity,
+                exact_key_match,
+                memory,
+            )
+        )
+
+    # 综合分数高的优先；
+    # 分数相同时优先精确匹配，再比较语义相似度。
+    scored_memories.sort(
+        key=lambda item: (
+            item[0],
+            item[2],
+            item[1],
+        ),
+        reverse=True,
+    )
+
+    # 最终只向DeepSeek提供最相关的top_k条记忆。
+    selected_memories = scored_memories[:top_k]
+
+    formatted_memories: list[str] = []
+
+    for (
+        final_score,
+        semantic_similarity,
+        exact_key_match,
+        memory,
+    ) in selected_memories:
+        summary = str(
+            memory.get("summary", "")
+        ).strip()
+
+        memory_key = str(
+            memory.get("memory_key", "")
+        ).strip()
+
+        # 缺少摘要的记录无法提供给NPC使用。
+        if not summary:
+            continue
+
+        match_type = (
+            "Qdrant memory_key精确匹配"
+            if exact_key_match
+            else "Qdrant语义匹配"
+        )
+
+        formatted_memories.append(
+            f"{summary}"
+            f"（记忆键：{memory_key}；"
+            f"匹配方式：{match_type}；"
+            f"语义相似度："
+            f"{semantic_similarity:.4f}；"
+            f"综合分数：{final_score:.4f}）"
+        )
+
+    return formatted_memories
+
+
+
+
+
+
+
+
+
+
+
 

@@ -28,17 +28,18 @@ FastAPI接口只需要调用process_dialogue()即可。
 - relationship_update：本轮好感度更新结果。
 - reply：NPC生成的回复。
 - memory_statistics：本轮长期记忆写入统计。
+- qdrant_store：由应用容器提供的Qdrant长期记忆存储器。
 """
 
 from typing import TYPE_CHECKING
 
 from api_models import DialogueResponse
 from memory import (
-    apply_memory_extraction,
     get_working_memory,
     load_memory,
     load_vector_memory,
     retrieve_relevant_memories,
+    retrieve_relevant_memories_from_qdrant,
     save_memory,
 )
 
@@ -151,10 +152,6 @@ class DialogueService:
                 memory_archive=memory_archive,
             )
 
-            # 加载结构化长期向量记忆。
-            vector_memories = load_vector_memory(
-                npc_id=npc_id,
-            )
 
             # 获取更新前的好感度。
             relationship = (
@@ -191,13 +188,21 @@ class DialogueService:
                     player_id=player_id,
                 )
 
-            # 检索与当前消息相关的长期记忆。
+            
+            # ==================================================
+            # 使用Qdrant检索长期记忆
+            # ==================================================
+
             try:
+                # 正常情况下只查询Qdrant，
+                # 不读取旧版向量JSON。
                 retrieved_memories = (
-                    retrieve_relevant_memories(
-                        vector_memories=(
-                            vector_memories
+                    retrieve_relevant_memories_from_qdrant(
+                        qdrant_store=(
+                            self.context.qdrant_store
                         ),
+                        npc_id=npc_id,
+                        player_id=player_id,
                         query=player_message,
                         embedding_model=(
                             self.context
@@ -207,17 +212,69 @@ class DialogueService:
                     )
                 )
 
-            except Exception as error:
-                # 检索失败时使用空长期记忆继续回复。
-                retrieved_memories = []
+                print(
+                    f"[Qdrant检索到"
+                    f"{len(retrieved_memories)}条"
+                    f"长期记忆]"
+                )
 
+            except Exception as qdrant_error:
+                # Qdrant发生真实异常时，
+                # 才读取旧版JSON进行回退。
                 self._log_error_safely(
-                    context="检索NPC长期记忆",
-                    error=error,
+                    context="Qdrant长期记忆检索",
+                    error=qdrant_error,
                     npc_id=npc_id,
                     player_id=player_id,
                 )
 
+                print(
+                    "[Qdrant检索失败，"
+                    "正在回退旧版JSON记忆]"
+                )
+
+                try:
+                    # 只有Qdrant出现故障时，
+                    # 才从磁盘读取完整向量JSON。
+                    json_vector_memories = (
+                        load_vector_memory(
+                            npc_id=npc_id,
+                        )
+                    )
+
+                    retrieved_memories = (
+                        retrieve_relevant_memories(
+                            vector_memories=(
+                                json_vector_memories
+                            ),
+                            query=player_message,
+                            embedding_model=(
+                                self.context
+                                .embedding_model
+                            ),
+                            query_plan=query_plan,
+                        )
+                    )
+
+                    print(
+                        f"[JSON回退检索到"
+                        f"{len(retrieved_memories)}条"
+                        f"长期记忆]"
+                    )
+
+                except Exception as json_error:
+                    # Qdrant和JSON都失败时，
+                    # 使用空长期记忆继续生成NPC回复。
+                    retrieved_memories = []
+
+                    self._log_error_safely(
+                        context="JSON长期记忆回退检索",
+                        error=json_error,
+                        npc_id=npc_id,
+                        player_id=player_id,
+                    )
+
+            
             # 使用记忆和当前好感度生成NPC回复。
             reply = npc.generate_reply(
                 conversation_history=conversation_history,
@@ -298,30 +355,42 @@ class DialogueService:
                     )
                 )
 
-                # 应用新增、更新、遗忘或跳过操作。
+                # 同时把记忆操作写入JSON和Qdrant。
+                #
+                # JSON目前仍然是主存储；
+                # Qdrant同步失败不会导致整轮对话失败。
+                # 使用QdrantMemoryManager执行长期记忆操作。
+                #
+                # 现在ADD、UPDATE和DELETE都以Qdrant为准，
+                # 操作成功后再自动生成旧版JSON备份。
                 memory_statistics = (
-                    apply_memory_extraction(
+                    self.context
+                    .qdrant_memory_manager
+                    .apply_extraction(
                         npc_id=npc_id,
-                        vector_memories=(
-                            vector_memories
-                        ),
+                        player_id=player_id,
                         extraction_result=(
                             extraction_result
-                        ),
-                        embedding_model=(
-                            self.context
-                            .embedding_model
                         ),
                     )
                 )
 
-                # 控制台显示简短记忆处理结果。
+                # 同时显示JSON操作和Qdrant同步情况，
+                # 方便迁移阶段发现两种存储是否一致。
                 print(
                     "[API长期记忆处理："
                     f"新增{memory_statistics['added']}条，"
                     f"更新{memory_statistics['updated']}条，"
                     f"删除{memory_statistics['deleted']}条，"
-                    f"跳过{memory_statistics['skipped']}条]"
+                    f"跳过{memory_statistics['skipped']}条；"
+                    f"Qdrant写入"
+                    f"{memory_statistics['qdrant_written']}条，"
+                    f"Qdrant删除"
+                    f"{memory_statistics['qdrant_deleted']}条，"
+                    f"Qdrant失败"
+                    f"{memory_statistics['qdrant_failed']}条，"
+                    f"JSON备份失败"
+                    f"{memory_statistics['backup_failed']}条]"
                 )
 
             except Exception as error:

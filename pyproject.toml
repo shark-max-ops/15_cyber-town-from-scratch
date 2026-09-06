@@ -7,6 +7,7 @@ dependencies = [
     "numpy>=2.4.6",
     "openai>=3.6.0",
     "python-dotenv>=1.2.3",
+    "qdrant-client>=1.19.0",
     "sentence-transformers>=6.0.1",
     "uvicorn[standard]>=0.52.4",
 ]
